@@ -17,23 +17,21 @@ import torch
 from megatron.core.dist_checkpointing.strategies.gemini_replicas_manager import (
     GeminiReplicasManager,
 )
-from megatron.training.legacy_io_utils import pin_payload_tensor_buffer_if_available
 from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
     allocate_hugepage_tensor,
     is_hugepage_cuda_registered,
 )
 from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     DecomposedStateDict,
-    GlobalMetadataRegistry,
     TensorMetadata,
-    decompose_state_dict,
+    assign_tensor_offsets,
     decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
     reconstruct_state_dict,
-    unflatten_optimizer_fp32_params,
-    assign_tensor_offsets,
     tensor_layout_size,
+    unflatten_optimizer_fp32_params,
 )
+from megatron.training.legacy_io_utils import pin_payload_tensor_buffer_if_available
 
 logger = getLogger(__name__)
 
@@ -86,7 +84,6 @@ def _gemini_recovery_profile(role: str, event: str, **fields) -> None:
     logger.debug("Gemini profile: %s", " ".join(parts))
 
 
-
 def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
     checkpoint_path = Path(checkpoint_name)
     return checkpoint_path if checkpoint_path.suffix == "" else checkpoint_path.parent
@@ -94,9 +91,9 @@ def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
 
 _BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
 
+
 def _build_global_registry(
-    local_metadata: List[TensorMetadata],
-    local_non_tensor: Dict[str, Any],
+    local_metadata: List[TensorMetadata], local_non_tensor: Dict[str, Any]
 ) -> Tuple[Dict[int, List[TensorMetadata]], Dict[int, Dict[str, Any]]]:
     if not torch.distributed.is_initialized():
         return {0: local_metadata}, {0: local_non_tensor}
@@ -117,9 +114,7 @@ def _build_global_registry(
     return rank_metadata, rank_non_tensor
 
 
-def _tensor_infos_to_local_metadata(
-    rank: int, tensor_infos: List[Any]
-) -> List[TensorMetadata]:
+def _tensor_infos_to_local_metadata(rank: int, tensor_infos: List[Any]) -> List[TensorMetadata]:
     out: List[TensorMetadata] = []
     for info in tensor_infos:
         out.append(
@@ -147,16 +142,14 @@ def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
         key = info["key"] if isinstance(info, dict) else info.key
         first_seg = key.split(".")[0]
         if first_seg == "model" or (
-            first_seg.startswith("model")
-            and len(first_seg) > 5
-            and first_seg[5:].isdigit()
+            first_seg.startswith("model") and len(first_seg) > 5 and first_seg[5:].isdigit()
         ):
             flat_key_roots.add(first_seg)
     return flat_key_roots
 
 
 def state_dict_from_gemini_replicas_main_metadata_only(
-    main_payload: Dict[str, Any],
+    main_payload: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Build state_dict from gemini_replicas main file payload (non-distributed)."""
     flat_key_roots = _infer_flat_key_roots(main_payload)
@@ -166,7 +159,11 @@ def state_dict_from_gemini_replicas_main_metadata_only(
         tensor_infos = main_payload["tensor_infos"]
         if tensor_infos and isinstance(tensor_infos[0], dict):
             tensor_infos = [_dict_to_tensor_info(info) for info in tensor_infos]
-        elif tensor_infos and hasattr(tensor_infos[0], 'dtype') and isinstance(tensor_infos[0].dtype, str):
+        elif (
+            tensor_infos
+            and hasattr(tensor_infos[0], 'dtype')
+            and isinstance(tensor_infos[0].dtype, str)
+        ):
             for info in tensor_infos:
                 ds = info.dtype
                 info.dtype = getattr(torch, ds.split(".")[-1]) if "." in ds else torch.float32
@@ -206,24 +203,22 @@ _cached_rank_tensor_infos: Optional[Dict[int, list]] = None
 def save_gemini_replicas_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
 ) -> None:
+    """Save a legacy Gemini Replicas checkpoint and distribute its replicas."""
     global _cached_rank_metadata, _cached_rank_non_tensor
     global _cached_rank_flat_key_roots, _cached_rank_tensor_infos
 
     from megatron.training import get_args
+
     args = get_args()
     debug_enabled = getattr(args, "gemini_replicas_debug", False)
 
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = (
-        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    )
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     manager = GeminiReplicasManager()
     manager.init_gemini_replicas_if_enabled()
     if manager._gemini_replicas_native is None:
-        raise RuntimeError(
-            "Gemini Replicas native module is not available in legacy save path"
-        )
+        raise RuntimeError("Gemini Replicas native module is not available in legacy save path")
 
     if manager.use_gdr:
         mirror_mode = os.environ.get("GEMINI_GDR_MIRROR_MODE", "eager").strip().lower()
@@ -240,30 +235,27 @@ def save_gemini_replicas_legacy_checkpoint(
                 "expected cpu_pipeline"
             )
     use_cpu_pipeline = not manager.use_gdr
-    prefer_torch_pinned_env = os.environ.get(
-        "GEMINI_SAVE_PREFER_TORCH_PINNED", "0"
-    ).strip()
+    prefer_torch_pinned_env = os.environ.get("GEMINI_SAVE_PREFER_TORCH_PINNED", "0").strip()
     if prefer_torch_pinned_env not in {"0", "1"}:
         raise RuntimeError(
             "Invalid GEMINI_SAVE_PREFER_TORCH_PINNED="
             f"{prefer_torch_pinned_env!r}; expected 0 or 1"
         )
-    prefer_torch_pinned = (
-        use_cpu_pipeline and prefer_torch_pinned_env == "1"
-    )
+    prefer_torch_pinned = use_cpu_pipeline and prefer_torch_pinned_env == "1"
     t0 = time.time()
     decomposed, save_copy_s, save_flatten_s, decompose_s = decompose_state_dict_for_save(state_dict)
     total_tensor_size = decomposed.total_tensor_size_bytes
     if debug_enabled:
         logger.info(
             "GEMINI save timing: copy %.3fs flatten %.3fs decompose %.3fs",
-            save_copy_s, save_flatten_s, decompose_s,
+            save_copy_s,
+            save_flatten_s,
+            decompose_s,
         )
 
     safety_margin = max(int(total_tensor_size * 0.01), 1024 * 1024)
     manager.allocate_preallocated_buffer(
-        total_tensor_size + safety_margin,
-        prefer_torch_pinned=prefer_torch_pinned,
+        total_tensor_size + safety_margin, prefer_torch_pinned=prefer_torch_pinned
     )
     tensor_buffer = manager.preallocated_cpu_buffer
 
@@ -281,9 +273,7 @@ def save_gemini_replicas_legacy_checkpoint(
                 dtype=str(info.dtype),
                 size_bytes=info.size_bytes,
                 offset=info.offset,
-                global_offset=tuple(info.global_offset)
-                if info.global_offset
-                else tuple(),
+                global_offset=tuple(info.global_offset) if info.global_offset else tuple(),
                 shard_index=info.shard_index if info.shard_index is not None else 0,
                 chunk_type="data",
                 target_rank=rank,
@@ -329,25 +319,16 @@ def save_gemini_replicas_legacy_checkpoint(
             logger.info(f"GEMINI save timing: metadata exchange (cached) {metadata_s:.3f}s")
 
     # Compute buffer sizes from the exchanged metadata.
-    rank_sizes = {
-        r: tensor_layout_size(rank_metadata[r])
-        for r in range(world_size)
-    }
+    rank_sizes = {r: tensor_layout_size(rank_metadata[r]) for r in range(world_size)}
 
     send_buffer_size = total_tensor_size
 
     pipeline_chunk_mb = 0
     num_seg = 1
     if use_cpu_pipeline:
-        pipeline_chunk_mb_env = os.environ.get(
-            "GEMINI_PIPELINE_CHUNK_MB", "0"
-        ).strip()
-        pipeline_max_segments_env = os.environ.get(
-            "GEMINI_PIPELINE_MAX_SEGMENTS", "128"
-        ).strip()
-        pipeline_segments_env = os.environ.get(
-            "GEMINI_PIPELINE_SEGMENTS", "4"
-        ).strip()
+        pipeline_chunk_mb_env = os.environ.get("GEMINI_PIPELINE_CHUNK_MB", "0").strip()
+        pipeline_max_segments_env = os.environ.get("GEMINI_PIPELINE_MAX_SEGMENTS", "128").strip()
+        pipeline_segments_env = os.environ.get("GEMINI_PIPELINE_SEGMENTS", "4").strip()
         try:
             pipeline_chunk_mb = int(pipeline_chunk_mb_env)
         except ValueError as exc:
@@ -388,9 +369,7 @@ def save_gemini_replicas_legacy_checkpoint(
         else:
             chunk_bytes = pipeline_chunk_mb * 1024 * 1024
             global_max_bytes = max(rank_sizes.values(), default=0)
-            num_seg = max(
-                1, (global_max_bytes + chunk_bytes - 1) // chunk_bytes
-            )
+            num_seg = max(1, (global_max_bytes + chunk_bytes - 1) // chunk_bytes)
             num_seg = min(num_seg, pipeline_max_segments)
 
     # Determine source ranks (ranks whose target list includes us)
@@ -410,7 +389,6 @@ def save_gemini_replicas_legacy_checkpoint(
             f"buffer={send_buffer_size / (1024**2):.2f} MB"
         )
 
-    t0 = time.time()
     # Allocate or reuse cached receive buffers
     receive_buffers: Dict[int, torch.Tensor] = {}
     for src_r in source_ranks:
@@ -419,8 +397,6 @@ def save_gemini_replicas_legacy_checkpoint(
         if manager.use_rdma:
             manager.register_buffer(recv_buf)
         receive_buffers[src_r] = recv_buf
-    recv_alloc_s = time.time() - t0
-
     native = manager._gemini_replicas_native
     native.reset_exchange_state()
     if world_size > 1:
@@ -505,16 +481,11 @@ def save_gemini_replicas_legacy_checkpoint(
             send_addr = gpu_tensor_buffer.data_ptr()
             if mirror_mode == "batch":
                 # Mirror each exact GPU range after all target sends for that range finish.
-                native.set_mirror_bases(
-                    gpu_tensor_buffer.data_ptr(),
-                    tensor_buffer.data_ptr(),
-                )
+                native.set_mirror_bases(gpu_tensor_buffer.data_ptr(), tensor_buffer.data_ptr())
             else:
                 native.set_mirror_bases(0, 0)
             if mirror_mode == "eager":
-                mirror_chunk_mb = max(
-                    1, int(os.environ.get("GEMINI_MIRROR_CHUNK_MB", "64"))
-                )
+                mirror_chunk_mb = max(1, int(os.environ.get("GEMINI_MIRROR_CHUNK_MB", "64")))
                 native.start_eager_mirror(
                     gpu_tensor_buffer.data_ptr(),
                     tensor_buffer.data_ptr(),
@@ -540,7 +511,8 @@ def save_gemini_replicas_legacy_checkpoint(
             if debug_enabled:
                 logger.info(
                     f"Gemini Replicas legacy save rank {rank}: executing C++ exchange "
-                    f"(send to {len(target_ranks) - 1} targets, recv from {len(source_ranks)} sources)..."
+                    f"(send to {len(target_ranks) - 1} targets, "
+                    f"recv from {len(source_ranks)} sources)..."
                 )
             _exchange_t0 = time.time()
             native.wait_for_exchange_completion()
@@ -550,9 +522,7 @@ def save_gemini_replicas_legacy_checkpoint(
             if manager.use_gdr:
                 _mirror_t0 = time.time()
                 if mirror_mode == "after_network" and exchange_completed:
-                    mirror_chunk_mb = max(
-                        1, int(os.environ.get("GEMINI_MIRROR_CHUNK_MB", "64"))
-                    )
+                    mirror_chunk_mb = max(1, int(os.environ.get("GEMINI_MIRROR_CHUNK_MB", "64")))
                     native.start_eager_mirror(
                         gpu_tensor_buffer.data_ptr(),
                         tensor_buffer.data_ptr(),
@@ -566,9 +536,12 @@ def save_gemini_replicas_legacy_checkpoint(
                 if debug_enabled:
                     logger.info(
                         "GEMINI save timing: mirror_d2h wall=%.3fs d2h_busy=%.3fs",
-                        mirror_d2h_s, d2h_s,
+                        mirror_d2h_s,
+                        d2h_s,
                     )
-        exchange_stats = native.get_exchange_stats() if hasattr(native, "get_exchange_stats") else {}
+        exchange_stats = (
+            native.get_exchange_stats() if hasattr(native, "get_exchange_stats") else {}
+        )
     e2e_s = time.time() - e2e_t0
     if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -578,26 +551,33 @@ def save_gemini_replicas_legacy_checkpoint(
         logger.info(
             "Gemini Replicas legacy save rank %d: C++ exchange done "
             "(submit=%.3fs wait=%.3fs e2e_s=%.3fs)",
-            rank, _submit_elapsed, _exchange_elapsed, e2e_s,
+            rank,
+            _submit_elapsed,
+            _exchange_elapsed,
+            e2e_s,
         )
 
-    summary = _timing_max_dict({
-        "e2e_s": e2e_s,
-        "pack_s": pack_s,
-        "d2h_s": d2h_s,
-        "mirror_d2h_s": mirror_d2h_s,
-        "network_encode_s": _exchange_elapsed,
-        "native_net_s": float(exchange_stats.get("net_s", 0.0)),
-    })
-    byte_summary = _timing_max_dict({
-        "send_bytes": float(exchange_stats.get("send_bytes", 0.0)),
-        "recv_bytes": float(exchange_stats.get("recv_bytes", 0.0)),
-        "send_tasks": float(exchange_stats.get("send_tasks", 0.0)),
-        "recv_tasks": float(exchange_stats.get("recv_tasks", 0.0)),
-        "mirror_tasks": float(exchange_stats.get("mirror_tasks", 0.0)),
-        "mirror_bytes": float(exchange_stats.get("mirror_bytes", 0.0)),
-        "mirror_d2h_busy_s": float(exchange_stats.get("mirror_d2h_busy_s", 0.0)),
-    })
+    summary = _timing_max_dict(
+        {
+            "e2e_s": e2e_s,
+            "pack_s": pack_s,
+            "d2h_s": d2h_s,
+            "mirror_d2h_s": mirror_d2h_s,
+            "network_encode_s": _exchange_elapsed,
+            "native_net_s": float(exchange_stats.get("net_s", 0.0)),
+        }
+    )
+    byte_summary = _timing_max_dict(
+        {
+            "send_bytes": float(exchange_stats.get("send_bytes", 0.0)),
+            "recv_bytes": float(exchange_stats.get("recv_bytes", 0.0)),
+            "send_tasks": float(exchange_stats.get("send_tasks", 0.0)),
+            "recv_tasks": float(exchange_stats.get("recv_tasks", 0.0)),
+            "mirror_tasks": float(exchange_stats.get("mirror_tasks", 0.0)),
+            "mirror_bytes": float(exchange_stats.get("mirror_bytes", 0.0)),
+            "mirror_d2h_busy_s": float(exchange_stats.get("mirror_d2h_busy_s", 0.0)),
+        }
+    )
     if rank == 0:
         if is_hugepage_cuda_registered(tensor_buffer):
             cpu_buffer_kind = "hugepage_registered"
@@ -649,22 +629,35 @@ def save_gemini_replicas_legacy_checkpoint(
     # Save .pt files
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
 
-    from megatron.training.legacy_io_utils import write_main_prepared, write_block_prepared, MAGIC_GEMINI, MAGIC_GEMINI_REPLICA
+    from megatron.training.legacy_io_utils import (
+        MAGIC_GEMINI,
+        MAGIC_GEMINI_REPLICA,
+        write_block_prepared,
+        write_main_prepared,
+    )
 
     # ---- Pre-serialize main file ----
     main_meta1 = pickle.dumps(decomposed.non_tensor_data)
     main_meta2 = pickle.dumps(rank_meta[rank]["tensor_infos"])
-    main_extra = pickle.dumps({
-        "version": 1, "format": "gemini_replicas_torch_legacy", "rank": rank,
-        "tensor_buffer_size": total_tensor_size,
-        "flat_key_roots": rank_meta[rank]["flat_key_roots"],
-        "world_size": world_size, "num_replicas": manager.num_replicas,
-        "group_size": manager.group_size,
-        "target_ranks": target_ranks, "source_ranks": source_ranks,
-        "all_tensor_infos": {r: rank_meta[r]["tensor_infos"] for r in range(world_size)},
-        "all_flat_key_roots": {r: rank_meta[r]["flat_key_roots"] for r in range(world_size)},
-        "all_tensor_buffer_sizes": {r: rank_meta[r]["tensor_buffer_size"] for r in range(world_size)},
-    })
+    main_extra = pickle.dumps(
+        {
+            "version": 1,
+            "format": "gemini_replicas_torch_legacy",
+            "rank": rank,
+            "tensor_buffer_size": total_tensor_size,
+            "flat_key_roots": rank_meta[rank]["flat_key_roots"],
+            "world_size": world_size,
+            "num_replicas": manager.num_replicas,
+            "group_size": manager.group_size,
+            "target_ranks": target_ranks,
+            "source_ranks": source_ranks,
+            "all_tensor_infos": {r: rank_meta[r]["tensor_infos"] for r in range(world_size)},
+            "all_flat_key_roots": {r: rank_meta[r]["flat_key_roots"] for r in range(world_size)},
+            "all_tensor_buffer_sizes": {
+                r: rank_meta[r]["tensor_buffer_size"] for r in range(world_size)
+            },
+        }
+    )
     buf = tensor_buffer[:total_tensor_size]
     if not buf.is_contiguous():
         buf = buf.contiguous()
@@ -674,14 +667,19 @@ def save_gemini_replicas_legacy_checkpoint(
     replica_tasks = []
     for src_r, recv_buf in receive_buffers.items():
         replica_file = checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{src_r}.pt"
-        meta_bytes = pickle.dumps({
-            "version": 1, "format": "gemini_replicas_torch_legacy",
-            "rank": rank, "source_rank": src_r, "buffer_size": recv_buf.numel(),
-            "source_tensor_infos": rank_meta[src_r]["tensor_infos"],
-            "source_non_tensor_data": rank_meta[src_r]["non_tensor_data"],
-            "source_flat_key_roots": rank_meta[src_r]["flat_key_roots"],
-            "source_tensor_buffer_size": rank_meta[src_r]["tensor_buffer_size"],
-        })
+        meta_bytes = pickle.dumps(
+            {
+                "version": 1,
+                "format": "gemini_replicas_torch_legacy",
+                "rank": rank,
+                "source_rank": src_r,
+                "buffer_size": recv_buf.numel(),
+                "source_tensor_infos": rank_meta[src_r]["tensor_infos"],
+                "source_non_tensor_data": rank_meta[src_r]["non_tensor_data"],
+                "source_flat_key_roots": rank_meta[src_r]["flat_key_roots"],
+                "source_tensor_buffer_size": rank_meta[src_r]["tensor_buffer_size"],
+            }
+        )
         b = recv_buf[: recv_buf.numel()]
         if not b.is_contiguous():
             b = b.contiguous()
@@ -693,19 +691,32 @@ def save_gemini_replicas_legacy_checkpoint(
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
         # ---- Parallel writes ----
         import concurrent.futures
+
         with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(replica_tasks)) as ex:
             main_file = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
-            futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_GEMINI,
-                              main_meta1, main_meta2, main_extra, main_mv, total_tensor_size)]
+            futs = [
+                ex.submit(
+                    write_main_prepared,
+                    str(main_file),
+                    MAGIC_GEMINI,
+                    main_meta1,
+                    main_meta2,
+                    main_extra,
+                    main_mv,
+                    total_tensor_size,
+                )
+            ]
             for rep_path, rep_meta, rep_mv in replica_tasks:
-                futs.append(ex.submit(_write_replica_file, rep_path, MAGIC_GEMINI_REPLICA,
-                                      rep_meta, rep_mv))
+                futs.append(
+                    ex.submit(_write_replica_file, rep_path, MAGIC_GEMINI_REPLICA, rep_meta, rep_mv)
+                )
             for f in futs:
                 f.result()
 
 
 def _write_replica_file(path, magic, meta_bytes, mv):
     import struct as _struct
+
     with open(path, "wb") as f:
         f.write(_struct.pack("<4sQ", magic, len(meta_bytes)))
         f.write(meta_bytes)
@@ -749,7 +760,11 @@ def _reconstruct_from_payload(
     if tensor_infos and isinstance(tensor_infos[0], dict):
         # Old format: dicts need full conversion (key, offset, dtype, etc.)
         ti_objs = [_dict_to_tensor_info(info) for info in tensor_infos]
-    elif tensor_infos and hasattr(tensor_infos[0], 'dtype') and isinstance(tensor_infos[0].dtype, str):
+    elif (
+        tensor_infos
+        and hasattr(tensor_infos[0], 'dtype')
+        and isinstance(tensor_infos[0].dtype, str)
+    ):
         # New format: TensorMetadata has str dtype → convert to torch.dtype for extract
         ti_objs = []
         for info in tensor_infos:
@@ -792,8 +807,11 @@ def _collect_metadata_for_failed_rank(
             own = local_main_payload
         else:
             from megatron.training.legacy_io_utils import (
-                is_raw_format, read_raw_checkpoint_metadata, MAGIC_GEMINI,
+                MAGIC_GEMINI,
+                is_raw_format,
+                read_raw_checkpoint_metadata,
             )
+
             own = (
                 read_raw_checkpoint_metadata(str(main_path), MAGIC_GEMINI)
                 if is_raw_format(str(main_path), MAGIC_GEMINI)
@@ -824,8 +842,8 @@ def _collect_metadata_for_failed_rank(
 
     raise RuntimeError(
         f"Gemini Replicas legacy load rank {rank}: "
-        f"no metadata available for recovery. "
-        f"At least one healthy rank must have a main file."
+        "no metadata available for recovery. "
+        "At least one healthy rank must have a main file."
     )
 
 
@@ -835,7 +853,8 @@ def _load_replica_metadata(replica_path: Path) -> Optional[Dict[str, Any]]:
     Used in Phase 2 to compute combined transfer size without loading the
     full multi-GB tensor buffer into memory.
     """
-    from megatron.training.legacy_io_utils import is_raw_format, MAGIC_GEMINI_REPLICA
+    from megatron.training.legacy_io_utils import MAGIC_GEMINI_REPLICA, is_raw_format
+
     try:
         if is_raw_format(str(replica_path), MAGIC_GEMINI_REPLICA):
             with open(str(replica_path), "rb") as _f:
@@ -852,15 +871,15 @@ def _load_replica_metadata(replica_path: Path) -> Optional[Dict[str, Any]]:
             }
     except Exception as e:
         logger.warning(
-            f"Gemini Replicas: failed to load replica metadata from "
-            f"{replica_path}: {e}"
+            "Gemini Replicas: failed to load replica metadata from %s: %s", replica_path, e
         )
         return None
 
 
 def _load_replica_full(replica_path: Path) -> Dict[str, Any]:
     """Load a replica file including its tensor buffer."""
-    from megatron.training.legacy_io_utils import is_raw_format, MAGIC_GEMINI_REPLICA
+    from megatron.training.legacy_io_utils import MAGIC_GEMINI_REPLICA, is_raw_format
+
     if is_raw_format(str(replica_path), MAGIC_GEMINI_REPLICA):
         with open(str(replica_path), "rb") as _f:
             _f.read(4)  # skip magic
@@ -868,13 +887,12 @@ def _load_replica_full(replica_path: Path) -> Dict[str, Any]:
             rp = pickle.loads(_f.read(meta_len))
             tensor_size = int(rp.get("source_tensor_buffer_size", 0))
             from megatron.training.legacy_io_utils import _allocate_read_buffer
+
             tensor_buffer = _allocate_read_buffer(tensor_size, pin=True)
             view = memoryview(tensor_buffer.numpy())
             bytes_read = _f.readinto(view)
             if bytes_read != tensor_size:
-                raise EOFError(
-                    f"Expected {tensor_size} bytes in {replica_path}, got {bytes_read}"
-                )
+                raise EOFError(f"Expected {tensor_size} bytes in {replica_path}, got {bytes_read}")
             rp["tensor_buffer"] = tensor_buffer
             return rp
     else:
@@ -889,9 +907,9 @@ def _as_uint8_send_buf(tensor: torch.Tensor) -> torch.Tensor:
 
 
 # Module-level caches pass collective results from preparation to transfer.
-_hw_assignments: Dict[int, Dict] = {}   # rank → {failed → sender, sender_rank, combined_size}
-_replica_needed: Dict[int, Dict] = {}    # rank → {src → sender}
-_replica_sizes: Dict[int, int] = {}      # src → combined_size
+_hw_assignments: Dict[int, Dict] = {}  # rank → {failed → sender, sender_rank, combined_size}
+_replica_needed: Dict[int, Dict] = {}  # rank → {src → sender}
+_replica_sizes: Dict[int, int] = {}  # src → combined_size
 _replica_failed_sources: Dict[int, List] = {}  # rank → [sources]
 _replica_failed: Set[int] = set()
 _replica_healthy: Set[int] = set()
@@ -913,8 +931,7 @@ def _hw_recovery_prepare(
             if rank not in manager._calculate_target_ranks(failed_rank, world_size):
                 continue
             replica_path = (
-                checkpoint_dir
-                / f"gemini_replicas_replica_rank{rank}_from{failed_rank}.pt"
+                checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{failed_rank}.pt"
             )
             if not replica_path.is_file():
                 continue
@@ -940,7 +957,8 @@ def _hw_recovery_prepare(
     for failed_rank in sorted(failed):
         group = set(rank_to_group.get(failed_rank, []))
         candidates = [
-            candidate for candidate in sorted(healthy & group)
+            candidate
+            for candidate in sorted(healthy & group)
             if failed_rank in (gathered[candidate] or {})
         ]
         if not candidates:
@@ -974,9 +992,7 @@ def _hw_recovery_prepare(
 
 
 def _hw_recovery_preload(
-    checkpoint_dir: Path,
-    rank: int,
-    world_size: int,
+    checkpoint_dir: Path, rank: int, world_size: int
 ) -> Optional[torch.Tensor]:
     """Pre-barrier: read replica files from disk + exchange metadata via NCCL.
 
@@ -991,12 +1007,8 @@ def _hw_recovery_preload(
         for f, s in global_assignments.items():
             if s != rank:
                 continue
-            replica_path = (
-                checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{f}.pt"
-            )
-            logger.debug(
-                f"Gemini Replicas recovery rank {rank}: preloading replica for rank {f}"
-            )
+            replica_path = checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{f}.pt"
+            logger.debug(f"Gemini Replicas recovery rank {rank}: preloading replica for rank {f}")
             rp = _load_replica_full(replica_path)
             meta = {
                 "tensor_infos": rp["source_tensor_infos"],
@@ -1049,10 +1061,19 @@ def _recovery_workspace_base_key(
         local_files.append((name, stat.st_size, stat.st_mtime_ns))
     backend = "rdma" if manager.use_rdma else "asio"
     return (
-        str(checkpoint_dir.resolve()), rank, world_size, manager.group_size,
-        manager.num_replicas, tuple(sorted(failed)), "hardware",
-        manager.gemini_replicas_pin_memory, manager.use_gdr, manager.use_rdma,
-        manager.channels_per_peer, backend, tuple(local_files),
+        str(checkpoint_dir.resolve()),
+        rank,
+        world_size,
+        manager.group_size,
+        manager.num_replicas,
+        tuple(sorted(failed)),
+        "hardware",
+        manager.gemini_replicas_pin_memory,
+        manager.use_gdr,
+        manager.use_rdma,
+        manager.channels_per_peer,
+        backend,
+        tuple(local_files),
     )
 
 
@@ -1115,27 +1136,24 @@ def _recovery_prealloc_buffers(
                 manager.register_buffer(buf)
     elif info and not info.get("is_sender"):
         tensor_size = sum(
-            m.size_bytes
-            for m in _recovery_meta.get(rank, {}).get("tensor_infos", [])
+            m.size_bytes for m in _recovery_meta.get(rank, {}).get("tensor_infos", [])
         ) or info.get("combined_size", 0)
         if tensor_size > 0:
             if reuse_workspace:
                 buf = manager.get_recovery_buffer(
-                    ("main_recv", rank), tensor_size, prefer_torch_pinned=True,
+                    ("main_recv", rank), tensor_size, prefer_torch_pinned=True
                 )
             else:
                 buf = None
                 if pin:
                     try:
-                        buf = torch.empty(
-                            tensor_size, dtype=torch.uint8, pin_memory=True,
-                        )
+                        buf = torch.empty(tensor_size, dtype=torch.uint8, pin_memory=True)
                     except Exception:
                         # Preserve the existing hugepage allocation as the fallback.
                         pass
                 if buf is None:
                     buf = allocate_hugepage_tensor(
-                        tensor_size, fallback_pin_memory=pin, touch_pages=True,
+                        tensor_size, fallback_pin_memory=pin, touch_pages=True
                     )
                 if manager.use_rdma:
                     manager.register_buffer(buf)
@@ -1163,17 +1181,14 @@ def _recovery_prealloc_buffers(
                 buf = manager.get_recovery_buffer(("replica_recv", rank, src), tensor_size)
             else:
                 buf = allocate_hugepage_tensor(
-                    tensor_size, fallback_pin_memory=pin, touch_pages=True,
+                    tensor_size, fallback_pin_memory=pin, touch_pages=True
                 )
                 if manager.use_rdma:
                     manager.register_buffer(buf)
             _replica_recv_bufs.setdefault(rank, {})[src] = buf
 
 
-def _hw_recovery_transfer(
-    manager: GeminiReplicasManager,
-    rank: int,
-) -> torch.Tensor:
+def _hw_recovery_transfer(manager: GeminiReplicasManager, rank: int) -> torch.Tensor:
     """Run the timed native tensor transfer after metadata exchange."""
     info = _hw_assignments.get(rank, {})
     if not info:
@@ -1199,9 +1214,10 @@ def _hw_recovery_transfer(
         return torch.zeros(0, dtype=torch.uint8)
     else:
         sender = info["sender"]
-        tensor_size = sum(
-            m.size_bytes for m in _recovery_meta.get(rank, {}).get("tensor_infos", [])
-        ) or info["combined_size"]
+        tensor_size = (
+            sum(m.size_bytes for m in _recovery_meta.get(rank, {}).get("tensor_infos", []))
+            or info["combined_size"]
+        )
         recv_buf = _hw_recv_bufs.get(rank)
         if recv_buf is None:
             raise RuntimeError(
@@ -1212,9 +1228,7 @@ def _hw_recovery_transfer(
             f"Gemini Replicas recovery rank {rank}: receiving "
             f"{tensor_size / (1024**2):.2f} MB from sender rank {sender}"
         )
-        recovered_buffer = manager.recv_from_rank(
-            sender, tensor_size, buffer=recv_buf,
-        )
+        recovered_buffer = manager.recv_from_rank(sender, tensor_size, buffer=recv_buf)
         logger.debug(
             f"Gemini Replicas recovery rank {rank}: received "
             f"{recovered_buffer.numel() / (1024**2):.2f} MB from sender {sender}"
@@ -1231,13 +1245,15 @@ def _replica_recovery_prepare(
     healthy: Set[int],
 ) -> None:
     """Build replica-restoration assignments from globally observed files."""
-    global _replica_needed, _replica_sizes, _replica_failed_sources, _replica_failed, _replica_healthy
+    global _replica_failed, _replica_failed_sources, _replica_healthy
+    global _replica_needed, _replica_sizes
 
     failed_sources: Dict[int, List[int]] = {}
     all_sources: Set[int] = set()
     for failed_rank in failed:
         sources = [
-            source for source in range(world_size)
+            source
+            for source in range(world_size)
             if source != failed_rank
             and failed_rank in manager._calculate_target_ranks(source, world_size)
         ]
@@ -1258,14 +1274,14 @@ def _replica_recovery_prepare(
         for source in sorted(all_sources):
             if rank == source:
                 info = _read_source_data_for_replica(
-                    checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt",
-                    None, rank, source,
+                    checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt", None, rank, source
                 )
             elif rank in manager._calculate_target_ranks(source, world_size):
                 info = _read_source_data_for_replica(
                     checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt",
                     checkpoint_dir / f"gemini_replicas_replica_rank{rank}_from{source}.pt",
-                    rank, source,
+                    rank,
+                    source,
                 )
             else:
                 info = None
@@ -1283,8 +1299,7 @@ def _replica_recovery_prepare(
     unavailable: List[int] = []
     for source in sorted(all_sources):
         candidates = [
-            candidate for candidate in sorted(healthy)
-            if source in (gathered[candidate] or {})
+            candidate for candidate in sorted(healthy) if source in (gathered[candidate] or {})
         ]
         if not candidates:
             unavailable.append(source)
@@ -1303,11 +1318,7 @@ def _replica_recovery_prepare(
     _replica_sizes = sizes
 
 
-def _replica_recovery_preload(
-    checkpoint_dir: Path,
-    rank: int,
-    world_size: int,
-) -> None:
+def _replica_recovery_preload(checkpoint_dir: Path, rank: int, world_size: int) -> None:
     """Pre-barrier: read replica files + single all_gather for all metadata."""
     global_needed = _replica_needed
     failed_sources = _replica_failed_sources
@@ -1325,10 +1336,9 @@ def _replica_recovery_preload(
 
             if src == rank:
                 mp = checkpoint_dir / f"gemini_replicas_main_rank{rank}.pt"
-                from megatron.training.legacy_io_utils import read_raw_checkpoint, MAGIC_GEMINI
-                payload = read_raw_checkpoint(
-                    str(mp), MAGIC_GEMINI, pin_tensor_buffer=True,
-                )
+                from megatron.training.legacy_io_utils import MAGIC_GEMINI, read_raw_checkpoint
+
+                payload = read_raw_checkpoint(str(mp), MAGIC_GEMINI, pin_tensor_buffer=True)
                 meta = {
                     "tensor_infos": payload["tensor_infos"],
                     "non_tensor_data": payload["non_tensor_data"],
@@ -1368,17 +1378,12 @@ def _replica_recovery_preload(
             meta = sender_meta.get(src)
             if meta is None:
                 continue
-            tensor_size = sum(
-                m.size_bytes for m in meta.get("tensor_infos", [])
-            )
+            tensor_size = sum(m.size_bytes for m in meta.get("tensor_infos", []))
             _replica_tensor_sizes[src] = tensor_size
 
 
 def _recover_missing_replicas_transfer(
-    manager: GeminiReplicasManager,
-    rank: int,
-    world_size: int,
-    failed: Set[int],
+    manager: GeminiReplicasManager, rank: int, world_size: int, failed: Set[int]
 ) -> None:
     """Restore replica tensors through the configured native transport."""
     global_needed = _replica_needed
@@ -1395,9 +1400,7 @@ def _recover_missing_replicas_transfer(
             # Use preloaded tensor (disk read already done)
             buf = _replica_preloaded.get(rank, {}).get(src)
             if buf is None:
-                raise RuntimeError(
-                    f"Replica for source {src} not preloaded on rank {rank}"
-                )
+                raise RuntimeError(f"Replica for source {src} not preloaded on rank {rank}")
             for f in sorted(failed):
                 if src not in failed_sources.get(f, []):
                     continue
@@ -1440,13 +1443,16 @@ def _read_source_data_for_replica(
 ) -> Optional[Tuple]:
     """Read source data for replica recovery size computation."""
     if src_r == rank:
-        from megatron.training.legacy_io_utils import is_raw_format, read_raw_checkpoint, MAGIC_GEMINI
+        from megatron.training.legacy_io_utils import (
+            MAGIC_GEMINI,
+            is_raw_format,
+            read_raw_checkpoint,
+        )
+
         if not main_path.is_file():
             return None
         if is_raw_format(str(main_path), MAGIC_GEMINI):
-            payload = read_raw_checkpoint(
-                str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True,
-            )
+            payload = read_raw_checkpoint(str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True)
             buf = payload["tensor_buffer"].detach().contiguous().view(torch.uint8)
             meta = {
                 "tensor_infos": payload["tensor_infos"],
@@ -1482,9 +1488,7 @@ _replica_recv_bufs: Dict[int, Dict[int, torch.Tensor]] = {}
 _replica_tensor_sizes: Dict[int, int] = {}
 
 
-def load_gemini_replicas_legacy_checkpoint(
-    checkpoint_name: str,
-) -> Dict[str, Any]:
+def load_gemini_replicas_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     """Load Gemini Replicas torch legacy checkpoint.
 
     Normal load (main file present):
@@ -1496,9 +1500,7 @@ def load_gemini_replicas_legacy_checkpoint(
     """
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = (
-        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    )
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     from megatron.training import get_args
 
@@ -1522,8 +1524,7 @@ def load_gemini_replicas_legacy_checkpoint(
     if recovery_rank_str:
         try:
             requested_ranks = [
-                int(token.strip()) for token in recovery_rank_str.split(",")
-                if token.strip()
+                int(token.strip()) for token in recovery_rank_str.split(",") if token.strip()
             ]
         except ValueError as exc:
             raise ValueError(
@@ -1554,8 +1555,12 @@ def load_gemini_replicas_legacy_checkpoint(
         if not main_file_exists:
             raise FileNotFoundError(f"Gemini Replicas load: missing main file {main_path}")
         from megatron.training.legacy_io_utils import (
-            is_raw_format, read_raw_checkpoint, read_raw_checkpoint_metadata, MAGIC_GEMINI,
+            MAGIC_GEMINI,
+            is_raw_format,
+            read_raw_checkpoint,
+            read_raw_checkpoint_metadata,
         )
+
         if is_raw_format(str(main_path), MAGIC_GEMINI):
             payload = (
                 read_raw_checkpoint(str(main_path), MAGIC_GEMINI, pin_tensor_buffer=True)
@@ -1607,12 +1612,16 @@ def load_gemini_replicas_legacy_checkpoint(
     recovery_role = "failed" if is_failed else "survivor"
     try:
         from megatron.training.global_vars import update_recovery_to_forward_timer_context
+
         update_recovery_to_forward_timer_context(role=recovery_role)
     except Exception:
         pass
     _gemini_recovery_profile(
-        recovery_role, "rank_role", is_failed=is_failed,
-        main_file_exists=main_file_exists, recovery_rank_str=bool(recovery_rank_str),
+        recovery_role,
+        "rank_role",
+        is_failed=is_failed,
+        main_file_exists=main_file_exists,
+        recovery_rank_str=bool(recovery_rank_str),
     )
 
     # ---- Software failure path ----
@@ -1621,6 +1630,7 @@ def load_gemini_replicas_legacy_checkpoint(
         if inprocess_recovery_active:
             try:
                 from megatron.training.global_vars import update_recovery_to_forward_timer_context
+
                 update_recovery_to_forward_timer_context(role="SW")
             except Exception:
                 pass
@@ -1644,11 +1654,13 @@ def load_gemini_replicas_legacy_checkpoint(
         _t['barrier'] = 0.0
         _t['total'] = _t['network_encode'] + _t['rebuild_sd']
         from megatron.training.global_vars import set_ft_load_timing_context
+
         set_ft_load_timing_context("GEMINI", "SW", _t)
         logger.debug(
             "GEMINI load timing (SW local): e2e_s=%(total).2fs "
             "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-            "barrier_s=%(barrier).2fs", _t
+            "barrier_s=%(barrier).2fs",
+            _t,
         )
         return state_dict
 
@@ -1672,11 +1684,13 @@ def load_gemini_replicas_legacy_checkpoint(
         _t['barrier'] = 0.0
         _t['total'] = _t['network_encode'] + _t['rebuild_sd']
         from megatron.training.global_vars import set_ft_load_timing_context
+
         set_ft_load_timing_context("GEMINI", "normal", _t)
         logger.debug(
             "GEMINI load timing (normal local): e2e_s=%(total).2fs "
             "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-            "barrier_s=%(barrier).2fs", _t
+            "barrier_s=%(barrier).2fs",
+            _t,
         )
     else:
         # ---- Hardware recovery ----
@@ -1704,11 +1718,10 @@ def load_gemini_replicas_legacy_checkpoint(
         healthy = set(range(world_size)) - failed
 
         workspace_base_key = _recovery_workspace_base_key(
-            manager, checkpoint_dir, rank, world_size, failed,
+            manager, checkpoint_dir, rank, world_size, failed
         )
         workspace_hit = _collective_bool_and(
-            inprocess_recovery_active
-            and manager.recovery_workspace_matches(workspace_base_key)
+            inprocess_recovery_active and manager.recovery_workspace_matches(workspace_base_key)
         )
         if not workspace_hit and inprocess_recovery_active:
             # A base-key change on any rank invalidates planning and transport everywhere.
@@ -1722,7 +1735,7 @@ def load_gemini_replicas_legacy_checkpoint(
             if workspace_hit:
                 try:
                     main_payload = manager.get_recovery_workspace_object(
-                        workspace_base_key, main_payload_cache_key,
+                        workspace_base_key, main_payload_cache_key
                     )
                 except KeyError as exc:
                     raise RuntimeError(
@@ -1740,7 +1753,9 @@ def load_gemini_replicas_legacy_checkpoint(
                 # until replica preload may already have loaded the same storage.
                 main_payload = _load_local_main_payload(load_tensor_buffer=False)
             meta = _collect_metadata_for_failed_rank(
-                checkpoint_dir, rank, world_size,
+                checkpoint_dir,
+                rank,
+                world_size,
                 local_main_payload=main_payload if inprocess_recovery_active else None,
             )
         metadata_s = time.perf_counter() - t_meta
@@ -1754,12 +1769,9 @@ def load_gemini_replicas_legacy_checkpoint(
                     for m in members:
                         rank_to_group[m] = members
             _hw_recovery_prepare(
-                manager, checkpoint_dir, rank, world_size,
-                rank_to_group, healthy, failed,
+                manager, checkpoint_dir, rank, world_size, rank_to_group, healthy, failed
             )
-            _replica_recovery_prepare(
-                manager, checkpoint_dir, rank, world_size, failed, healthy,
-            )
+            _replica_recovery_prepare(manager, checkpoint_dir, rank, world_size, failed, healthy)
         plan_s = time.perf_counter() - t_plan
 
         t_reset = time.perf_counter()
@@ -1787,14 +1799,9 @@ def load_gemini_replicas_legacy_checkpoint(
             replica_main = _replica_preloaded.get(rank, {}).get(rank)
             expected_numel = main_payload.get("tensor_buffer_size")
             replica_main_uint8 = (
-                _as_uint8_send_buf(replica_main)
-                if isinstance(replica_main, torch.Tensor)
-                else None
+                _as_uint8_send_buf(replica_main) if isinstance(replica_main, torch.Tensor) else None
             )
-            if (
-                replica_main_uint8 is not None
-                and replica_main_uint8.numel() == expected_numel
-            ):
+            if replica_main_uint8 is not None and replica_main_uint8.numel() == expected_numel:
                 main_payload["tensor_buffer"] = replica_main_uint8
                 main_payload_source = "replica self-source preload"
             else:
@@ -1804,8 +1811,7 @@ def load_gemini_replicas_legacy_checkpoint(
             healthy_main_preload_s = time.perf_counter() - t_main_preload
 
         _gemini_recovery_profile(
-            recovery_role, "preload_done",
-            elapsed_s=healthy_main_preload_s + recovery_preload_s,
+            recovery_role, "preload_done", elapsed_s=healthy_main_preload_s + recovery_preload_s
         )
 
         # Setup (not timed): prepare buffers and register them when using RDMA.
@@ -1814,43 +1820,49 @@ def load_gemini_replicas_legacy_checkpoint(
             _replica_recv_bufs.pop(rank, None)
         t_prealloc = time.perf_counter()
         _recovery_prealloc_buffers(
-            manager, rank, failed, healthy,
-            reuse_workspace=inprocess_recovery_active,
+            manager, rank, failed, healthy, reuse_workspace=inprocess_recovery_active
         )
         alloc_register_s = time.perf_counter() - t_prealloc
         if not workspace_hit and inprocess_recovery_active:
             if not is_failed:
                 manager.set_recovery_workspace_object(
-                    workspace_base_key, main_payload_cache_key, main_payload,
+                    workspace_base_key, main_payload_cache_key, main_payload
                 )
-            manager.begin_recovery_workspace(
-                workspace_base_key, _recovery_workspace_size_key(rank),
-            )
+            manager.begin_recovery_workspace(workspace_base_key, _recovery_workspace_size_key(rank))
         # metadata_s is reported separately; do not count it again here.
         disk_preload_s = recovery_preload_s + healthy_main_preload_s
         setup_s = time.perf_counter() - t_setup
-        setup_summary = _timing_max_dict({
-            "metadata": metadata_s,
-            "plan": plan_s,
-            "alloc_register": alloc_register_s,
-            "reset": reset_s,
-            "disk_preload": disk_preload_s,
-            "healthy_main_preload": healthy_main_preload_s,
-            "total": setup_s,
-        })
+        setup_summary = _timing_max_dict(
+            {
+                "metadata": metadata_s,
+                "plan": plan_s,
+                "alloc_register": alloc_register_s,
+                "reset": reset_s,
+                "disk_preload": disk_preload_s,
+                "healthy_main_preload": healthy_main_preload_s,
+                "total": setup_s,
+            }
+        )
         if rank == 0 and inprocess_recovery_active:
             logger.info(
                 "Gemini recovery workspace: cache=%s setup_s=%.3f "
                 "metadata_s=%.3f plan_s=%.3f alloc_register_s=%.3f "
                 "reset_s=%.3f disk_preload_s=%.3f healthy_main_preload_s=%.3f",
-                "hit" if workspace_hit else "miss", setup_summary["total"],
-                setup_summary["metadata"], setup_summary["plan"],
-                setup_summary["alloc_register"], setup_summary["reset"],
-                setup_summary["disk_preload"], setup_summary["healthy_main_preload"],
+                "hit" if workspace_hit else "miss",
+                setup_summary["total"],
+                setup_summary["metadata"],
+                setup_summary["plan"],
+                setup_summary["alloc_register"],
+                setup_summary["reset"],
+                setup_summary["disk_preload"],
+                setup_summary["healthy_main_preload"],
             )
         _gemini_recovery_profile(
-            recovery_role, "setup_done", elapsed_s=setup_s,
-            failed_count=len(failed), healthy_count=len(healthy),
+            recovery_role,
+            "setup_done",
+            elapsed_s=setup_s,
+            failed_count=len(failed),
+            healthy_count=len(healthy),
         )
 
         # Sync all ranks after setup so network timing excludes setup skew.
@@ -1860,9 +1872,9 @@ def load_gemini_replicas_legacy_checkpoint(
         _t0 = time.time()
         try:
             from megatron.training.global_vars import start_recovery_to_forward_timer
+
             start_recovery_to_forward_timer(
-                "Gemini Replicas", "network_transfer",
-                role=recovery_role, rank0_only_max=True,
+                "Gemini Replicas", "network_transfer", role=recovery_role, rank0_only_max=True
             )
         except Exception:
             pass
@@ -1872,19 +1884,20 @@ def load_gemini_replicas_legacy_checkpoint(
         _t['network_encode'] = time.time() - _t0
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("gemini_network_done")
             mark_recovery_to_forward_timer("gemini_transport_buffer_ready")
         except Exception:
             pass
         _gemini_recovery_profile(
-            recovery_role, "network_transfer_done",
-            elapsed_s=_t['network_encode'], is_failed=is_failed,
+            recovery_role,
+            "network_transfer_done",
+            elapsed_s=_t['network_encode'],
+            is_failed=is_failed,
         )
         # Rebuild happens after network transfer completion; no extra timing barrier needed.
         prep_copy_s = 0.0
-        if not is_failed and (
-            main_payload is None or main_payload.get("tensor_buffer") is None
-        ):
+        if not is_failed and (main_payload is None or main_payload.get("tensor_buffer") is None):
             if inprocess_recovery_active:
                 raise RuntimeError(
                     "Gemini in-process recovery reached post-network rebuild without "
@@ -1916,31 +1929,30 @@ def load_gemini_replicas_legacy_checkpoint(
                 flat_key_roots=_infer_flat_key_roots(main_payload),
             )
         _t['rebuild_sd'] = time.time() - _t0_sd
-        _gemini_recovery_profile(
-            recovery_role, "rebuild_done", elapsed_s=_t['rebuild_sd']
-        )
+        _gemini_recovery_profile(recovery_role, "rebuild_done", elapsed_s=_t['rebuild_sd'])
         _t['barrier'] = barrier_s
         _t['total'] = _t['network_encode'] + _t['rebuild_sd']
         from megatron.training.global_vars import set_ft_load_timing_context
+
         hw_mode = "HW1" if len(failed) == 1 else ("HW2" if len(failed) == 2 else "HWN")
         set_ft_load_timing_context("GEMINI", hw_mode, _t)
 
         logger.debug(
             f"GEMINI load timing ({hw_mode} local): e2e_s=%(total).2fs "
             "network_encode_s=%(network_encode).2fs rebuild_sd_s=%(rebuild_sd).2fs "
-            "barrier_s=%(barrier).2fs", _t
+            "barrier_s=%(barrier).2fs",
+            _t,
         )
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("gemini_load_rebuild_done")
         except Exception:
             pass
 
     skip_cleanup = bool(getattr(args, "ft_inprocess_recovery_benchmark", False))
     if manager._gemini_replicas_native is not None and not skip_cleanup:
-        logger.debug(
-            f"Gemini Replicas legacy load: cleaning up native module (rank {rank})"
-        )
+        logger.debug(f"Gemini Replicas legacy load: cleaning up native module (rank {rank})")
         _gemini_recovery_profile(recovery_role, "cleanup_start")
         t_cleanup = time.time()
         manager.cleanup()
@@ -1948,17 +1960,17 @@ def load_gemini_replicas_legacy_checkpoint(
         cleanup_s = time.time() - t_cleanup
         try:
             from megatron.training.global_vars import add_recovery_teardown_time
+
             add_recovery_teardown_time(cleanup_s)
         except Exception:
             pass
-        _gemini_recovery_profile(
-            recovery_role, "cleanup_done", elapsed_s=cleanup_s
-        )
+        _gemini_recovery_profile(recovery_role, "cleanup_done", elapsed_s=cleanup_s)
     elif skip_cleanup:
         _gemini_recovery_profile(recovery_role, "cleanup_skipped_inprocess")
 
     try:
         from megatron.training.global_vars import mark_recovery_to_forward_timer
+
         mark_recovery_to_forward_timer("gemini_final_barrier_start")
     except Exception:
         pass
@@ -1968,18 +1980,21 @@ def load_gemini_replicas_legacy_checkpoint(
         torch.distributed.barrier()
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("gemini_final_barrier_done")
         except Exception:
             pass
     elif skip_cleanup:
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("gemini_final_barrier_skipped_inprocess")
         except Exception:
             pass
 
     try:
         from megatron.training.global_vars import mark_recovery_to_forward_timer
+
         mark_recovery_to_forward_timer("gemini_load_return")
     except Exception:
         pass

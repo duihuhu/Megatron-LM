@@ -27,9 +27,7 @@ logger = getLogger(__name__)
 def _save_prefer_torch_pinned() -> bool:
     value = os.environ.get("CONCORD_SAVE_PREFER_TORCH_PINNED", "0")
     if value not in ("0", "1"):
-        raise RuntimeError(
-            "CONCORD_SAVE_PREFER_TORCH_PINNED must be exactly 0 or 1"
-        )
+        raise RuntimeError("CONCORD_SAVE_PREFER_TORCH_PINNED must be exactly 0 or 1")
     return value == "1"
 
 
@@ -38,6 +36,7 @@ def _concord_debug_enabled() -> bool:
         return True
     try:
         from megatron.training import get_args
+
         return bool(getattr(get_args(), "concord_debug", False))
     except Exception:
         return False
@@ -45,19 +44,21 @@ def _concord_debug_enabled() -> bool:
 
 class StripeRole(IntEnum):
     """Role of this rank within a single POA stripe."""
+
     SOURCE = 0
     ENCODER = 1
     PARITY_TARGET = 2
     # Recovery roles (mirror save roles)
-    HELPER = 3        # Sends stripe block to decoder
-    DECODER = 4       # Receives, RS-decodes, sends to failed rank
-    FAILED_RANK = 5   # Receives decoded blocks, assembles per-layer
-    INACTIVE = 6      # Outside the active k+m POA prefix
+    HELPER = 3  # Sends stripe block to decoder
+    DECODER = 4  # Receives, RS-decodes, sends to failed rank
+    FAILED_RANK = 5  # Receives decoded blocks, assembles per-layer
+    INACTIVE = 6  # Outside the active k+m POA prefix
 
 
 @dataclass
 class StripePlan:
     """Pre-compiled action plan for a single stripe."""
+
     stripe_id: int
     row: List[int]
     role: StripeRole
@@ -71,6 +72,7 @@ class StripePlan:
 @dataclass
 class LayerStripeBufs:
     """Per-layer encode buffers: source region + CPU mirror + stripe role bufs."""
+
     layer_buf_gpu: torch.Tensor
     layer_mirror_cpu: torch.Tensor
     recv_bufs: List[Optional[torch.Tensor]]
@@ -169,7 +171,7 @@ class ConcordManager:
             if self._full_buf.numel() >= size_bytes:
                 return self._full_buf
         self._full_buf = allocate_hugepage_tensor(
-            size_bytes, fallback_pin_memory=torch.cuda.is_available(),
+            size_bytes, fallback_pin_memory=torch.cuda.is_available()
         )
         return self._full_buf
 
@@ -177,9 +179,7 @@ class ConcordManager:
         """Total GPU/CPU mirror bytes for one layer (n_src * block_size)."""
         bs = self._layer_block_sizes.get(layer_idx) if self._layer_block_sizes else None
         if bs is None:
-            raise RuntimeError(
-                f"Concord: block size not computed for layer_idx={layer_idx}"
-            )
+            raise RuntimeError(f"Concord: block size not computed for layer_idx={layer_idx}")
         n_src = (self.concord_n - 1) * self.concord_k
         return n_src * bs
 
@@ -212,7 +212,7 @@ class ConcordManager:
             for g in layer_groups:
                 if native is not None:
                     self._allocate_layer_stripe_bufs(
-                        native, g.layer_idx, self._layer_block_sizes[g.layer_idx],
+                        native, g.layer_idx, self._layer_block_sizes[g.layer_idx]
                     )
             return
         ws = torch.distributed.get_world_size()
@@ -260,7 +260,9 @@ class ConcordManager:
                 self._layer_per_rank_bytes[lidx] = per_rank
 
         native = self._concord_native
-        max_blk = max(self._layer_block_sizes.values()) if self._layer_block_sizes else self.block_size
+        max_blk = (
+            max(self._layer_block_sizes.values()) if self._layer_block_sizes else self.block_size
+        )
         for g in layer_groups:
             lidx = g.layer_idx
             bs = self._layer_block_sizes[lidx]
@@ -270,16 +272,18 @@ class ConcordManager:
         if _concord_debug_enabled():
             logger.debug(
                 "Concord: computed per-layer block sizes (max=%dMB): %s",
-                max_blk // (1024*1024),
-                [(f"layer_{k}", f"{v//(1024*1024)}MB") for k, v
-                 in sorted(self._layer_block_sizes.items())])
+                max_blk // (1024 * 1024),
+                [
+                    (f"layer_{k}", f"{v//(1024*1024)}MB")
+                    for k, v in sorted(self._layer_block_sizes.items())
+                ],
+            )
 
     def get_layer_stripe_bufs(self, layer_idx: int) -> LayerStripeBufs:
+        """Return the allocated stripe buffers for one layer."""
         bufs = self.layer_stripe_bufs.get(layer_idx)
         if bufs is None:
-            raise RuntimeError(
-                f"Concord: stripe buffers not allocated for layer_idx={layer_idx}"
-            )
+            raise RuntimeError(f"Concord: stripe buffers not allocated for layer_idx={layer_idx}")
         return bufs
 
     def get_layer_parity_bufs(
@@ -301,7 +305,11 @@ class ConcordManager:
         self.use_concord = bool(getattr(args, "use_concord", False))
         if not self.use_concord:
             return
-        if self._concord_native is not None and self.stripe_plans and not self._concord_recovery_native_cleaned:
+        if (
+            self._concord_native is not None
+            and self.stripe_plans
+            and not self._concord_recovery_native_cleaned
+        ):
             return
         if self._concord_recovery_native_cleaned:
             # Drop the cleaned native handle only when reinitializing in the main
@@ -322,7 +330,10 @@ class ConcordManager:
         if _concord_debug_enabled():
             logger.debug(
                 "CONCORD init trace rank=%d: grouping group_id=%s rank_in_group=%s members=%s",
-                rank, self.group_id, self.rank_in_group, self.group_member_ranks,
+                rank,
+                self.group_id,
+                self.rank_in_group,
+                self.group_member_ranks,
             )
         self._init_concord_native(path)
         if _concord_debug_enabled():
@@ -342,7 +353,8 @@ class ConcordManager:
         if _concord_debug_enabled():
             logger.debug(
                 "Concord: GDR required (enabled), n=%d num_stripes=%d",
-                self.concord_n, self.num_stripes,
+                self.concord_n,
+                self.num_stripes,
             )
 
         # Init RDMA connections within group (allocates buffers using num_stripes)
@@ -395,10 +407,7 @@ class ConcordManager:
     @classmethod
     def _get_group_layout(cls, world_size: int, n: int) -> Dict[str, int]:
         if world_size <= 0:
-            return {
-                "mode": 0, "num_groups": 1, "ranks_per_node": 1,
-                "num_nodes": 1, "clusters": 1,
-            }
+            return {"mode": 0, "num_groups": 1, "ranks_per_node": 1, "num_nodes": 1, "clusters": 1}
         num_groups = max(1, world_size // n)
         ranks_per_node = cls._get_ranks_per_node()
         if (
@@ -413,12 +422,15 @@ class ConcordManager:
                 node_aware_groups = ranks_per_node * clusters
                 if node_aware_groups == num_groups:
                     return {
-                        "mode": 1, "num_groups": num_groups,
+                        "mode": 1,
+                        "num_groups": num_groups,
                         "ranks_per_node": ranks_per_node,
-                        "num_nodes": num_nodes, "clusters": clusters,
+                        "num_nodes": num_nodes,
+                        "clusters": clusters,
                     }
         return {
-            "mode": 0, "num_groups": num_groups,
+            "mode": 0,
+            "num_groups": num_groups,
             "ranks_per_node": max(1, ranks_per_node),
             "num_nodes": max(1, world_size // max(1, ranks_per_node)),
             "clusters": 1,
@@ -512,11 +524,7 @@ class ConcordManager:
                 "Concord: --concord-table-dir is required when --concord-table-path is not set."
             )
         d = Path(table_dir).resolve()
-        candidates = [
-            d / f"concord_poa_n{n}.txt",
-            d / f"poa_n{n}.txt",
-            d / f"n{n}.poa",
-        ]
+        candidates = [d / f"concord_poa_n{n}.txt", d / f"poa_n{n}.txt", d / f"n{n}.poa"]
         for c in candidates:
             if c.is_file():
                 self.concord_table_path = str(c)
@@ -527,8 +535,11 @@ class ConcordManager:
     def _validate_and_build_grouping(self, n: int) -> None:
         if not torch.distributed.is_initialized():
             self.group_layout = {
-                "mode": 0, "num_groups": 1, "ranks_per_node": 1,
-                "num_nodes": 1, "clusters": 1,
+                "mode": 0,
+                "num_groups": 1,
+                "ranks_per_node": 1,
+                "num_nodes": 1,
+                "clusters": 1,
             }
             self.group_id = 0
             self.rank_in_group = 0
@@ -555,8 +566,7 @@ class ConcordManager:
         self.group_id = self._get_group_id(rank, world_size, n)
         self.rank_in_group = self._get_rank_in_group(rank, world_size, n)
         self.group_member_ranks = [
-            self._get_rank_by_group_position(self.group_id, i, world_size, n)
-            for i in range(n)
+            self._get_rank_by_group_position(self.group_id, i, world_size, n) for i in range(n)
         ]
         self.node_slot_to_global_rank = {
             i + 1: self.group_member_ranks[i] for i in range(len(self.group_member_ranks))
@@ -575,9 +585,7 @@ class ConcordManager:
             spec.loader.exec_module(mod)
             if _concord_debug_enabled():
                 logger.debug("Concord: loaded native module from %s", so_path)
-            self._concord_native = mod.ConcordNative(
-                poa_path, self.concord_k, self.concord_m
-            )
+            self._concord_native = mod.ConcordNative(poa_path, self.concord_k, self.concord_m)
             self.concord_table_path = poa_path
             if _concord_debug_enabled():
                 logger.debug(
@@ -612,9 +620,13 @@ class ConcordManager:
         # Exchange IPs across all ranks (GPU tensors required for NCCL backend)
         ip_bytes = my_ip.encode("utf-8").ljust(64, b"\x00")[:64]
         ip_tensor = torch.tensor([b for b in ip_bytes], dtype=torch.uint8, device="cuda")
-        ip_list_tensors = [torch.zeros(64, dtype=torch.uint8, device="cuda") for _ in range(world_size)]
+        ip_list_tensors = [
+            torch.zeros(64, dtype=torch.uint8, device="cuda") for _ in range(world_size)
+        ]
         if _concord_debug_enabled():
-            logger.debug("CONCORD init trace rank=%d: before ip all_gather world_size=%d", rank, world_size)
+            logger.debug(
+                "CONCORD init trace rank=%d: before ip all_gather world_size=%d", rank, world_size
+            )
         torch.distributed.all_gather(ip_list_tensors, ip_tensor)
         if _concord_debug_enabled():
             logger.debug("CONCORD init trace rank=%d: after ip all_gather", rank)
@@ -639,12 +651,21 @@ class ConcordManager:
 
         if _concord_debug_enabled():
             logger.debug(
-                "CONCORD init trace rank=%d: before native.init_rdma rg=%d/%d base_port=%d peers=%s",
-                rank, rg, n, base_port, peer_ips,
+                "CONCORD init trace rank=%d: before native.init_rdma "
+                "rg=%d/%d base_port=%d peers=%s",
+                rank,
+                rg,
+                n,
+                base_port,
+                peer_ips,
             )
             logger.debug(
                 "Concord RDMA: rank_in_group=%d/%d base_port=%d my_ip=%s peers=%s",
-                rg, n, base_port, my_ip, peer_ips,
+                rg,
+                n,
+                base_port,
+                my_ip,
+                peer_ips,
             )
 
         native.init_rdma(
@@ -676,11 +697,7 @@ class ConcordManager:
 
     def _resolve_my_ip(self) -> str:
         """Determine my IP for listen socket, with multi-NIC per-rank support."""
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized()
-            else None
-        )
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else None
         return resolve_ip("CONCORD", rank=rank)
 
     def _allocate_default_buffers(self, native) -> None:
@@ -702,8 +719,7 @@ class ConcordManager:
             self.parity2_buffer = None
             if _concord_debug_enabled():
                 logger.debug(
-                    "Concord: skipped legacy default buffers block_size=%s",
-                    default_block_size,
+                    "Concord: skipped legacy default buffers block_size=%s", default_block_size
                 )
             return
 
@@ -718,16 +734,15 @@ class ConcordManager:
         if _concord_debug_enabled():
             logger.debug(
                 "Concord: allocated legacy default buffer block_size=%s recv_total=%s",
-                default_block_size, recv_total,
+                default_block_size,
+                recv_total,
             )
 
     def _allocate_layer_stripe_bufs(
         self, native, layer_idx: int, block_sz: int, source_on_cpu: bool = False
     ) -> None:
         """Allocate per-stripe buffers for one layer (grows-only per layer_idx)."""
-        prefer_torch_pinned = (
-            _save_prefer_torch_pinned() if not source_on_cpu else False
-        )
+        prefer_torch_pinned = _save_prefer_torch_pinned() if not source_on_cpu else False
         mirror_prefer_torch_pinned = prefer_torch_pinned
         prev = self._layer_stripe_alloc_sizes.get(layer_idx, 0)
         prev_bufs = self.layer_stripe_bufs.get(layer_idx)
@@ -747,26 +762,28 @@ class ConcordManager:
 
         native.set_require_registered_mr(True)
 
-        enc_indices = [sid for sid in range(self.num_stripes)
-                       if self.stripe_plans[sid].role == StripeRole.ENCODER]
-        par_indices = [sid for sid in range(self.num_stripes)
-                       if self.stripe_plans[sid].role == StripeRole.PARITY_TARGET]
+        enc_indices = [
+            sid
+            for sid in range(self.num_stripes)
+            if self.stripe_plans[sid].role == StripeRole.ENCODER
+        ]
+        par_indices = [
+            sid
+            for sid in range(self.num_stripes)
+            if self.stripe_plans[sid].role == StripeRole.PARITY_TARGET
+        ]
 
         mirror_buffer_kind = "host"
         if mirror_prefer_torch_pinned and torch.cuda.is_available():
             try:
-                layer_mirror_cpu = torch.empty(
-                    layer_capacity, dtype=torch.uint8, pin_memory=True
-                )
+                layer_mirror_cpu = torch.empty(layer_capacity, dtype=torch.uint8, pin_memory=True)
                 mirror_buffer_kind = "torch_pinned"
             except Exception:
                 layer_mirror_cpu = allocate_hugepage_tensor(
                     layer_capacity, fallback_pin_memory=True
                 )
         else:
-            layer_mirror_cpu = allocate_hugepage_tensor(
-                layer_capacity, fallback_pin_memory=True
-            )
+            layer_mirror_cpu = allocate_hugepage_tensor(layer_capacity, fallback_pin_memory=True)
         if mirror_buffer_kind != "torch_pinned":
             if is_hugepage_cuda_registered(layer_mirror_cpu):
                 mirror_buffer_kind = "hugepage_registered"
@@ -827,7 +844,8 @@ class ConcordManager:
 
         for parity_index in range(self.concord_m):
             parity_indices = [
-                sid for sid, plan in enumerate(self.stripe_plans)
+                sid
+                for sid, plan in enumerate(self.stripe_plans)
                 if plan.role == StripeRole.ENCODER
                 or (plan.role == StripeRole.PARITY_TARGET and plan.parity_index == parity_index)
             ]
@@ -844,9 +862,7 @@ class ConcordManager:
                     self._rdma_registered_addrs.add(addr)
 
         parity1_bufs = parity_bufs[0]
-        parity2_bufs = (
-            parity_bufs[1] if self.concord_m > 1 else [None] * self.num_stripes
-        )
+        parity2_bufs = parity_bufs[1] if self.concord_m > 1 else [None] * self.num_stripes
 
         layer_bufs = LayerStripeBufs(
             layer_buf_gpu=layer_buf_gpu,
@@ -874,7 +890,8 @@ class ConcordManager:
                 lname,
                 block_sz // (1024 * 1024),
                 layer_capacity // (1024 * 1024),
-                len(enc_indices), len(par_indices),
+                len(enc_indices),
+                len(par_indices),
             )
 
     def _compile_stripe_plans(self) -> None:
@@ -901,8 +918,7 @@ class ConcordManager:
             logger.debug(
                 "Concord: compiled %d stripe plans, role_counts=%s",
                 ns,
-                {r.name: sum(1 for p in self.stripe_plans if p.role == r)
-                 for r in StripeRole},
+                {r.name: sum(1 for p in self.stripe_plans if p.role == r) for r in StripeRole},
             )
 
     def allocate_registered_save_buffer(self, size_bytes: int) -> torch.Tensor:
@@ -912,9 +928,7 @@ class ConcordManager:
         native = self._concord_native
         if native is None:
             raise RuntimeError("Concord native module is not initialized")
-        buffer = allocate_hugepage_tensor(
-            size_bytes, fallback_pin_memory=torch.cuda.is_available(),
-        )
+        buffer = allocate_hugepage_tensor(size_bytes, fallback_pin_memory=torch.cuda.is_available())
         addr = int(buffer.data_ptr())
         native.register_buffer(addr, int(buffer.numel()))
         self._rdma_registered_addrs.add(addr)
@@ -949,10 +963,7 @@ class ConcordManager:
                     native.unregister_buffer(addr)
             except BaseException as exc:
                 failures.append((addr, exc))
-                logger.warning(
-                    "Concord: failed to unregister save buffer addr=0x%x: %s",
-                    addr, exc,
-                )
+                logger.warning("Concord: failed to unregister save buffer addr=0x%x: %s", addr, exc)
                 continue
             self._rdma_registered_addrs.discard(addr)
             self._registered_save_buffer_owners.pop(addr, None)
@@ -963,12 +974,15 @@ class ConcordManager:
             ) from failures[0][1]
 
     def get_native(self) -> Any:
+        """Return the loaded Concord native module."""
         return self._concord_native
 
     def get_resolved_table_path(self) -> Optional[str]:
+        """Return the resolved POA table path."""
         return self.concord_table_path
 
     def get_runtime_layout(self) -> Dict[str, Any]:
+        """Return the resolved Concord runtime layout."""
         return {
             "n": self.concord_n,
             "k": self.concord_k,
@@ -986,9 +1000,7 @@ class ConcordManager:
     # ---- Hardware recovery ----
 
     @staticmethod
-    def _role_for_node_in_row(
-        row: List[int], node_id: int, k: int, m: int
-    ) -> StripeRole:
+    def _role_for_node_in_row(row: List[int], node_id: int, k: int, m: int) -> StripeRole:
         """Stripe role for a node id (1-based) in a POA row."""
         pos = row.index(node_id)
         if pos < k:
@@ -1009,29 +1021,30 @@ class ConcordManager:
             if failed_pos >= active_width:
                 continue
             survivor_positions = [
-                (failed_pos + offset) % active_width
-                for offset in range(1, active_width)
+                (failed_pos + offset) % active_width for offset in range(1, active_width)
             ][:k]
             decoder_pos = survivor_positions[0]
             helper_positions = survivor_positions[1:]
-            plans.append({
-                'stripe_id': sid,
-                'dual_failure': False,
-                'failed_node': failed_rank_node,
-                'failed_pos': failed_pos,
-                'recovery_kind': 'data' if failed_pos < k else 'parity',
-                'round_id': failed_pos,
-                'decoder_node': row[decoder_pos],
-                'decoder_pos': decoder_pos,
-                'helper_nodes': [row[p] for p in helper_positions],
-                'helper_positions': helper_positions,
-                'survivor_positions': survivor_positions,
-                'original_role': int(
-                    self._role_for_node_in_row(
-                        row, failed_rank_node, self.concord_k, self.concord_m
-                    )
-                ),
-            })
+            plans.append(
+                {
+                    'stripe_id': sid,
+                    'dual_failure': False,
+                    'failed_node': failed_rank_node,
+                    'failed_pos': failed_pos,
+                    'recovery_kind': 'data' if failed_pos < k else 'parity',
+                    'round_id': failed_pos,
+                    'decoder_node': row[decoder_pos],
+                    'decoder_pos': decoder_pos,
+                    'helper_nodes': [row[p] for p in helper_positions],
+                    'helper_positions': helper_positions,
+                    'survivor_positions': survivor_positions,
+                    'original_role': int(
+                        self._role_for_node_in_row(
+                            row, failed_rank_node, self.concord_k, self.concord_m
+                        )
+                    ),
+                }
+            )
         return plans
 
     def _compile_recovery_plans_dual(self, failed_nodes: List[int]) -> List[Dict]:
@@ -1058,13 +1071,15 @@ class ConcordManager:
                     raise RuntimeError(
                         f"Concord dual recovery: failed node {fn} missing in stripe {sid}"
                     )
-                failed_targets.append({
-                    'failed_node': fn,
-                    'failed_pos': fp,
-                    'original_role': int(
-                        self._role_for_node_in_row(row, fn, self.concord_k, self.concord_m)
-                    ),
-                })
+                failed_targets.append(
+                    {
+                        'failed_node': fn,
+                        'failed_pos': fp,
+                        'original_role': int(
+                            self._role_for_node_in_row(row, fn, self.concord_k, self.concord_m)
+                        ),
+                    }
+                )
             survivor_positions = [i for i in range(n) if row[i] not in failed_set]
             if len(survivor_positions) != n - 2:
                 raise RuntimeError(
@@ -1073,27 +1088,30 @@ class ConcordManager:
                 )
             decoder_pos = survivor_positions[0]
             helper_positions = survivor_positions[1:]
-            plans.append({
-                'stripe_id': sid,
-                'dual_failure': True,
-                'failed_nodes': list(failed_nodes),
-                'failed_targets': failed_targets,
-                'decoder_node': row[decoder_pos],
-                'decoder_pos': decoder_pos,
-                'helper_nodes': [row[p] for p in helper_positions],
-                'helper_positions': helper_positions,
-                'survivor_positions': survivor_positions,
-                'original_role': int(sp.role),
-                # Critical recovery restores SOURCE data; parity ownership is repaired later.
-                'recovery_kind': (
-                    'data' if any(
-                        target['original_role'] in (
-                            int(StripeRole.SOURCE), int(StripeRole.ENCODER)
+            plans.append(
+                {
+                    'stripe_id': sid,
+                    'dual_failure': True,
+                    'failed_nodes': list(failed_nodes),
+                    'failed_targets': failed_targets,
+                    'decoder_node': row[decoder_pos],
+                    'decoder_pos': decoder_pos,
+                    'helper_nodes': [row[p] for p in helper_positions],
+                    'helper_positions': helper_positions,
+                    'survivor_positions': survivor_positions,
+                    'original_role': int(sp.role),
+                    # Critical recovery restores SOURCE data; parity ownership is repaired later.
+                    'recovery_kind': (
+                        'data'
+                        if any(
+                            target['original_role']
+                            in (int(StripeRole.SOURCE), int(StripeRole.ENCODER))
+                            for target in failed_targets
                         )
-                        for target in failed_targets
-                    ) else 'parity'
-                ),
-            })
+                        else 'parity'
+                    ),
+                }
+            )
         return plans
 
     def init_concord_hardware_recovery(self, failed_global_ranks: List[int]) -> Dict[int, Dict]:
@@ -1114,8 +1132,6 @@ class ConcordManager:
             raise RuntimeError("Concord hardware recovery requires torch.distributed")
 
         world_size = torch.distributed.get_world_size()
-        my_rank = torch.distributed.get_rank()
-
         self.is_recovery_mode = True
         self.failed_global_ranks = list(failed_global_ranks)
         self.recovery_dual_failure = False
@@ -1129,11 +1145,7 @@ class ConcordManager:
             failed_rig = self._get_rank_in_group(failed_rank, world_size, self.concord_n)
             failed_node = failed_rig + 1  # 1-based in POA
 
-            ctx = {
-                'group_id': group_id,
-                'failed_rig': failed_rig,
-                'failed_node': failed_node,
-            }
+            ctx = {'group_id': group_id, 'failed_rig': failed_rig, 'failed_node': failed_node}
             recovery_contexts[failed_rank] = ctx
 
             if group_id not in all_groups_failed:
@@ -1172,9 +1184,7 @@ class ConcordManager:
                 failed_nodes = sorted(
                     recovery_contexts[fr]['failed_node'] for fr in failed_in_my_group
                 )
-                self.recovery_stripe_plans = self._compile_recovery_plans_dual(
-                    failed_nodes
-                )
+                self.recovery_stripe_plans = self._compile_recovery_plans_dual(failed_nodes)
                 self.recovery_dual_failure = True
                 for fr in failed_in_my_group:
                     recovery_contexts[fr]['recovery_plans'] = self.recovery_stripe_plans
@@ -1193,7 +1203,6 @@ class ConcordManager:
 
         return recovery_contexts
 
-
     def get_inprocess_recovery_workspace(self, key: Any) -> Optional[Dict[str, Any]]:
         """Return the benchmark recovery workspace, rejecting unsafe key changes."""
         if self._inprocess_recovery_workspace is None:
@@ -1206,9 +1215,7 @@ class ConcordManager:
             )
         return self._inprocess_recovery_workspace
 
-    def set_inprocess_recovery_workspace(
-        self, key: Any, workspace: Dict[str, Any]
-    ) -> None:
+    def set_inprocess_recovery_workspace(self, key: Any, workspace: Dict[str, Any]) -> None:
         """Install one manager-owned benchmark workspace after setup completes."""
         if self._inprocess_recovery_workspace is not None:
             if self._inprocess_recovery_workspace_key != key:
@@ -1252,8 +1259,7 @@ class ConcordManager:
                 native.unregister_buffer(addr)
             except Exception as e:
                 logger.warning(
-                    "Concord: rank %d failed to unregister buffer 0x%x: %s",
-                    rank, addr, e,
+                    "Concord: rank %d failed to unregister buffer 0x%x: %s", rank, addr, e
                 )
                 continue
             self._rdma_registered_addrs.discard(addr)
@@ -1332,10 +1338,9 @@ class ConcordManager:
         # Active maps are cleared so the next save owns freshly registered RDMA buffers.
         retired = [self._concord_native]
         retired.extend(self.layer_stripe_bufs.values())
-        retired.extend([
-            self.data_buffer, self.recv_buffer,
-            self.parity1_buffer, self.parity2_buffer,
-        ])
+        retired.extend(
+            [self.data_buffer, self.recv_buffer, self.parity1_buffer, self.parity2_buffer]
+        )
         self._retired_runtime_buffers.extend(x for x in retired if x is not None)
         self._concord_native = None
         self._concord_recovery_native_cleaned = False
@@ -1367,7 +1372,11 @@ class ConcordManager:
         if not teardown:
             return
         try:
-            if sync and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            if (
+                sync
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            ):
                 torch.distributed.barrier()
             self.cleanup_recovery_runtime()
             self._clear_recovery_native_handle()
@@ -1384,7 +1393,11 @@ class ConcordManager:
         if not teardown:
             return
         try:
-            if sync and torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+            if (
+                sync
+                and torch.distributed.is_initialized()
+                and torch.distributed.get_world_size() > 1
+            ):
                 torch.distributed.barrier()
             self._unregister_all_buffers()
             self.stop()

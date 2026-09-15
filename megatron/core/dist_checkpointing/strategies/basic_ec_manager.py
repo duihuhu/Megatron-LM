@@ -10,8 +10,10 @@ from logging import getLogger
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
+
 from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
+
+from .hugepage_alloc import allocate_hugepage_slices, allocate_hugepage_tensor
 
 logger = getLogger(__name__)
 
@@ -22,22 +24,22 @@ DEFAULT_PORTS_PER_RANK = 9
 
 class BasicECManager:
     """Shared manager for BasicEC C++ module initialization and buffer management.
-    
+
     This class provides a singleton instance that manages:
     - BasicEC C++ native module (_basic_ec_native)
     - Buffer allocation and management (data and parity buffers, pooled)
     - Buffer poller thread for releasing buffers
-    
+
     Persistent storage consists of one local data block and n - 1 received
     blocks. The strategy allocates these blocks after metadata exchange.
-    
+
     Both TorchDistSaveShardedStrategy and TorchDistLoadShardedStrategy
     can share the same manager instance to reuse initialized resources.
     """
-    
+
     _instance: Optional['BasicECManager'] = None
     _lock = threading.Lock()
-    
+
     def __new__(cls):
         """Singleton pattern to ensure only one instance exists."""
         if cls._instance is None:
@@ -46,7 +48,7 @@ class BasicECManager:
                     cls._instance = super().__new__(cls)
                     cls._instance._initialized = False
         return cls._instance
-    
+
     def __init__(self):
         """Initialize the manager (only once due to singleton)."""
         if hasattr(self, '_initialized') and self._initialized:
@@ -66,21 +68,21 @@ class BasicECManager:
         self.basic_ec_parity_buffers_count = 12  # Pooled parity buffers
         self.basic_ec_buffer_size = 64 * 1024 * 1024  # 64MB
         self.basic_ec_pin_memory = True
-        
+
         # Buffers (simplified: only data and parity pools)
         self.basic_ec_data_buffers: Optional[List[torch.Tensor]] = None
         self.basic_ec_parity_buffers: Optional[List[torch.Tensor]] = None  # Pooled parity buffers
         # The strategy allocates one local and n - 1 received persistent blocks.
-        
+
         # Free buffer queues (simplified)
         self._free_data_buffer_queue: Optional[queue.Queue] = None
         self._free_parity_buffer_queue: Optional[queue.Queue] = None
-        
+
         # Buffer poller thread
         self._buffer_poller_thread: Optional[threading.Thread] = None
         self._buffer_poller_stop_event: Optional[threading.Event] = None
         self._buffer_poller_active_event: Optional[threading.Event] = None
-        
+
         # RDMA buffer registry (similar to Gemini)
         self.registered_buffers = {}  # {addr: (size, iteration)}
         self.current_iteration = 0
@@ -111,15 +113,16 @@ class BasicECManager:
             f"BasicEC: Allocating preallocated buffer: {size_bytes / (1024**3):.2f} GB (pin={pin})"
         )
         self.preallocated_cpu_buffer = allocate_hugepage_tensor(
-            size_bytes, fallback_pin_memory=pin, touch_pages=False,
+            size_bytes, fallback_pin_memory=pin, touch_pages=False
         )
 
     _cached_block_count: int = 0
     _cached_block_size: int = 0
     _cached_blocks: Optional[List[torch.Tensor]] = None
 
-    def allocate_preallocated_blocks(self, count: int, aligned_size: int,
-                                      pin: Optional[bool] = None):
+    def allocate_preallocated_blocks(
+        self, count: int, aligned_size: int, pin: Optional[bool] = None
+    ):
         """Allocate or reuse cached persistent blocks (n = k+2 blocks).
 
         Args:
@@ -128,8 +131,11 @@ class BasicECManager:
             pin: Whether to pin memory. None = use manager default.
                  Set False during load to avoid exhausting CUDA lockable memory.
         """
-        if (self._cached_blocks is not None and self._cached_block_count == count
-                and self._cached_block_size >= aligned_size):
+        if (
+            self._cached_blocks is not None
+            and self._cached_block_count == count
+            and self._cached_block_size >= aligned_size
+        ):
             return self._cached_blocks
         if pin is None:
             pin = self.basic_ec_pin_memory and torch.cuda.is_available()
@@ -137,9 +143,9 @@ class BasicECManager:
             f"BasicEC: Allocating {count} blocks: {aligned_size / (1024**3):.2f} GB each "
             f"({count * aligned_size / (1024**3):.2f} GB total, pin={pin})"
         )
-        self._cached_blocks = list(allocate_hugepage_slices(
-            aligned_size, count, fallback_pin_memory=pin, touch_pages=True,
-        ))
+        self._cached_blocks = list(
+            allocate_hugepage_slices(aligned_size, count, fallback_pin_memory=pin, touch_pages=True)
+        )
         self._cached_block_count = count
         self._cached_block_size = aligned_size
         if self.use_rdma:
@@ -191,13 +197,7 @@ class BasicECManager:
         """
         n = self.basic_ec_n
         if world_size <= 0:
-            return {
-                "mode": 0,
-                "num_groups": 1,
-                "ranks_per_node": 1,
-                "num_nodes": 1,
-                "clusters": 1,
-            }
+            return {"mode": 0, "num_groups": 1, "ranks_per_node": 1, "num_nodes": 1, "clusters": 1}
         num_groups = max(1, world_size // n)
         ranks_per_node = self._get_ranks_per_node()
         if (
@@ -300,15 +300,19 @@ class BasicECManager:
             for j in range(1, k):
                 target_ig = (rank_in_group + j) % n
                 src_ig = (rank_in_group - j) % n
-                send_partners.append(self._get_rank_by_group_position(group_id, target_ig, world_size))
+                send_partners.append(
+                    self._get_rank_by_group_position(group_id, target_ig, world_size)
+                )
                 recv_partners.append(self._get_rank_by_group_position(group_id, src_ig, world_size))
                 send_block_types.append(f"data_{j}")
-                recv_block_types.append(f"data")  # received block is a data block from another rank
+                recv_block_types.append("data")  # received block is a data block from another rank
 
             # Parity 0: send to rank_in_group + k
             p0_target_ig = (rank_in_group + k) % n
             p0_src_ig = (rank_in_group - k) % n
-            send_partners.append(self._get_rank_by_group_position(group_id, p0_target_ig, world_size))
+            send_partners.append(
+                self._get_rank_by_group_position(group_id, p0_target_ig, world_size)
+            )
             recv_partners.append(self._get_rank_by_group_position(group_id, p0_src_ig, world_size))
             send_block_types.append("parity0")
             recv_block_types.append("parity0")
@@ -316,7 +320,9 @@ class BasicECManager:
             # Parity 1: send to rank_in_group + k + 1
             p1_target_ig = (rank_in_group + k + 1) % n
             p1_src_ig = (rank_in_group - k - 1) % n
-            send_partners.append(self._get_rank_by_group_position(group_id, p1_target_ig, world_size))
+            send_partners.append(
+                self._get_rank_by_group_position(group_id, p1_target_ig, world_size)
+            )
             recv_partners.append(self._get_rank_by_group_position(group_id, p1_src_ig, world_size))
             send_block_types.append("parity1")
             recv_block_types.append("parity1")
@@ -330,14 +336,16 @@ class BasicECManager:
 
             # Compatibility aliases for the legacy RS(4, 2) layout.
             if k == 2:
-                result.update({
-                    'send_data1_to': send_partners[0],
-                    'send_parity0_to': send_partners[1],
-                    'send_parity1_to': send_partners[2],
-                    'recv_parity1_from': recv_partners[0],
-                    'recv_parity0_from': recv_partners[1],
-                    'recv_data1_from': recv_partners[2],
-                })
+                result.update(
+                    {
+                        'send_data1_to': send_partners[0],
+                        'send_parity0_to': send_partners[1],
+                        'send_parity1_to': send_partners[2],
+                        'recv_parity1_from': recv_partners[0],
+                        'recv_parity0_from': recv_partners[1],
+                        'recv_data1_from': recv_partners[2],
+                    }
+                )
 
             return result
 
@@ -367,30 +375,32 @@ class BasicECManager:
             'recv_block_types': recv_block_types,
         }
         if k == 2:
-            result.update({
-                'send_data1_to': send_partners[0],
-                'send_parity0_to': send_partners[1],
-                'send_parity1_to': send_partners[2],
-                'recv_parity1_from': recv_partners[0],
-                'recv_parity0_from': recv_partners[1],
-                'recv_data1_from': recv_partners[2],
-            })
+            result.update(
+                {
+                    'send_data1_to': send_partners[0],
+                    'send_parity0_to': send_partners[1],
+                    'send_parity1_to': send_partners[2],
+                    'recv_parity1_from': recv_partners[0],
+                    'recv_parity0_from': recv_partners[1],
+                    'recv_data1_from': recv_partners[2],
+                }
+            )
         return result
-    
+
     def _get_basic_ec_network_config(self, rank: int, world_size: int) -> dict:
         """
         Get network configuration for BasicEC ASIO connections.
-        
+
         This function:
         1. Gets base IP address (from BASIC_EC_BASE_IP env var, MASTER_ADDR, or auto-detect)
         2. Assigns 3 * (n - 1) ports to each rank or group position
         3. Exchanges IP addresses with all ranks via torch.distributed.all_gather
         4. Returns configuration dictionary
-        
+
         Args:
             rank (int): Current rank
             world_size (int): Total number of ranks
-            
+
         Returns:
             dict: Network configuration with keys:
                 - 'my_ip': str - This rank's IP address
@@ -409,8 +419,12 @@ class BasicECManager:
         # Step 2: Get base port
         # Priority: BASIC_EC_BASE_PORT > MASTER_PORT + 10000 > default 16000
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
-        base_port = int(os.environ.get('BASIC_EC_BASE_PORT', os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000)))
-        
+        base_port = int(
+            os.environ.get(
+                'BASIC_EC_BASE_PORT', os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000)
+            )
+        )
+
         # Step 3: assign each rank n - 1 ASIO send ports, n - 1 ASIO
         # receive ports, and n - 1 RDMA exchange receive ports. Group-based
         # allocation keeps concurrently initialized groups on distinct ports.
@@ -436,46 +450,44 @@ class BasicECManager:
         }
         # Preserve the named port keys used by the legacy RS(4, 2) path.
         if k == 2:
-            ports.update({
-                'send_data1': send_ports[0],
-                'send_parity0': send_ports[1],
-                'send_parity1': send_ports[2] if len(send_ports) > 2 else None,
-                'recv_parity1': recv_ports[0],
-                'recv_parity0': recv_ports[1],
-                'recv_data1': recv_ports[2] if len(recv_ports) > 2 else None,
-                'rdma_recv_parity1': rdma_recv_ports[0],
-                'rdma_recv_parity0': rdma_recv_ports[1],
-                'rdma_recv_data1': rdma_recv_ports[2] if len(rdma_recv_ports) > 2 else None,
-            })
-        
+            ports.update(
+                {
+                    'send_data1': send_ports[0],
+                    'send_parity0': send_ports[1],
+                    'send_parity1': send_ports[2] if len(send_ports) > 2 else None,
+                    'recv_parity1': recv_ports[0],
+                    'recv_parity0': recv_ports[1],
+                    'recv_data1': recv_ports[2] if len(recv_ports) > 2 else None,
+                    'rdma_recv_parity1': rdma_recv_ports[0],
+                    'rdma_recv_parity0': rdma_recv_ports[1],
+                    'rdma_recv_data1': rdma_recv_ports[2] if len(rdma_recv_ports) > 2 else None,
+                }
+            )
+
         # Step 4: Exchange IP addresses via torch.distributed.all_gather
         rank_ips = {}
-        
+
         if torch.distributed.is_initialized():
             try:
                 # Convert IP to bytes, then to int list for tensor
                 my_ip_bytes = socket.inet_aton(base_ip)
-                my_ip_tensor = torch.tensor(
-                    [int(b) for b in my_ip_bytes], 
-                    dtype=torch.uint8
-                )
-                
+                my_ip_tensor = torch.tensor([int(b) for b in my_ip_bytes], dtype=torch.uint8)
+
                 # Move to CUDA if available (for NCCL backend compatibility)
                 if torch.cuda.is_available():
                     my_ip_tensor = my_ip_tensor.cuda()
-                
+
                 # Gather all IPs
                 ip_list = [torch.zeros_like(my_ip_tensor) for _ in range(world_size)]
                 torch.distributed.all_gather(ip_list, my_ip_tensor)
-                
+
                 # Convert back to IP strings
                 for r, ip_tensor in enumerate(ip_list):
                     ip_bytes = bytes(ip_tensor.cpu().tolist())
                     rank_ips[r] = socket.inet_ntoa(ip_bytes)
-                
+
                 logger.debug(
-                    f"BasicEC: [Rank {rank}] IP exchange completed - "
-                    f"All rank IPs: {rank_ips}"
+                    f"BasicEC: [Rank {rank}] IP exchange completed - " f"All rank IPs: {rank_ips}"
                 )
             except Exception as e:
                 logger.warning(
@@ -488,14 +500,9 @@ class BasicECManager:
             # Single rank mode - use local IP
             logger.debug("BasicEC: Distributed not initialized, using local IP for all ranks")
             rank_ips[0] = base_ip
-        
-        config = {
-            'my_ip': base_ip,
-            'base_port': base_port,
-            'rank_ips': rank_ips,
-            'ports': ports,
-        }
-        
+
+        config = {'my_ip': base_ip, 'base_port': base_port, 'rank_ips': rank_ips, 'ports': ports}
+
         logger.debug(
             f"BasicEC: [Rank {rank}] Network config:\n"
             f"  My IP: {config['my_ip']}\n"
@@ -503,9 +510,9 @@ class BasicECManager:
             f"  Ports: {config['ports']}\n"
             f"  All rank IPs: {config['rank_ips']}"
         )
-        
+
         return config
-    
+
     def _get_basic_ec_load_network_config(self, rank: int, world_size: int) -> dict:
         """
         Get network configuration for the legacy k=2 hardware-recovery path.
@@ -519,12 +526,12 @@ class BasicECManager:
         - load_recv_rank1_parity1: rank2 listens, rank1 connects (for p_{1,1})
         - load_recv_rank3_data0: rank2 listens, rank3 connects (for d_{3,0})
         - load_recv_rank0_data1: rank2 listens, rank0 connects (for d_{3,1})
-        
+
         Args:
             rank (int): Current global rank; group rank 2 receives and the other
                 RS(4, 2) group ranks send.
             world_size (int): Total number of ranks
-            
+
         Returns:
             dict: Network configuration with keys:
                 - 'my_ip': str - This rank's IP address
@@ -537,17 +544,19 @@ class BasicECManager:
 
         # Get base port (same as save mode)
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
-        base_port = int(os.environ.get('BASIC_EC_BASE_PORT', os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000)))
-        
+        base_port = int(
+            os.environ.get(
+                'BASIC_EC_BASE_PORT', os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000)
+            )
+        )
+
         # Multi-rank: per-group load ports to avoid conflict
         n = self.basic_ec_n
         group_id = self._get_group_id(rank, world_size)
         rank_in_group = self._get_rank_in_group(rank, world_size)
         # load_receiver_rank: global rank of rank_in_group 2 in this group (for init_basic_ec_load)
         load_receiver_rank = (
-            self._get_rank_by_group_position(group_id, 2, world_size)
-            if world_size >= n
-            else 2
+            self._get_rank_by_group_position(group_id, 2, world_size) if world_size >= n else 2
         )
         load_base_port = base_port + 1000 + group_id * 100
         # All ranks in group get same 8 ports (receiver binds, others connect)
@@ -561,28 +570,25 @@ class BasicECManager:
             'load_recv_rank3_data0': load_base_port + 6,
             'load_recv_rank0_data1': load_base_port + 7,
         }
-        
+
         # Exchange IP addresses via torch.distributed.all_gather
         rank_ips = {}
-        
+
         if torch.distributed.is_initialized():
             try:
                 my_ip_bytes = socket.inet_aton(base_ip)
-                my_ip_tensor = torch.tensor(
-                    [int(b) for b in my_ip_bytes], 
-                    dtype=torch.uint8
-                )
-                
+                my_ip_tensor = torch.tensor([int(b) for b in my_ip_bytes], dtype=torch.uint8)
+
                 if torch.cuda.is_available():
                     my_ip_tensor = my_ip_tensor.cuda()
-                
+
                 ip_list = [torch.zeros_like(my_ip_tensor) for _ in range(world_size)]
                 torch.distributed.all_gather(ip_list, my_ip_tensor)
-                
+
                 for r, ip_tensor in enumerate(ip_list):
                     ip_bytes = bytes(ip_tensor.cpu().tolist())
                     rank_ips[r] = socket.inet_ntoa(ip_bytes)
-                
+
                 logger.debug(
                     f"BasicEC: [Rank {rank}] Load mode IP exchange completed - "
                     f"All rank IPs: {rank_ips}"
@@ -596,7 +602,7 @@ class BasicECManager:
         else:
             logger.debug("BasicEC: Distributed not initialized, using local IP for all ranks")
             rank_ips[0] = base_ip
-        
+
         config = {
             'my_ip': base_ip,
             'base_port': base_port,
@@ -606,18 +612,19 @@ class BasicECManager:
             'group_id': group_id,
             'load_receiver_rank': load_receiver_rank,
         }
-        
+
         logger.debug(
             f"BasicEC: [Rank {rank}] Load mode network config:\n"
             f"  My IP: {config['my_ip']}\n"
             f"  Base port: {config['base_port']}\n"
-            f"  rank_in_group: {rank_in_group}, group_id: {group_id}, load_receiver_rank: {load_receiver_rank}\n"
+            f"  rank_in_group: {rank_in_group}, group_id: {group_id}, "
+            f"load_receiver_rank: {load_receiver_rank}\n"
             f"  Load mode ports: {config['ports']}\n"
             f"  All rank IPs: {config['rank_ips']}"
         )
-        
+
         return config
-    
+
     def init_basic_ec_load_software_only(
         self, rank: int, world_size: int, net_config: Optional[dict] = None
     ) -> None:
@@ -635,7 +642,9 @@ class BasicECManager:
             return
         failed_rank = 2
         self._basic_ec_native.set_load_mode(True, failed_rank, rank, is_software_only=True)
-        logger.debug(f"BasicEC: [Rank {rank}] Set load mode (failed_rank={failed_rank}) for software-only")
+        logger.debug(
+            f"BasicEC: [Rank {rank}] Set load mode (failed_rank={failed_rank}) for software-only"
+        )
         if net_config is None:
             net_config = self._get_basic_ec_load_network_config(rank, world_size)
         rank_in_group = net_config['rank_in_group']
@@ -650,8 +659,9 @@ class BasicECManager:
 
     # ---- Generalized SW recovery (k-1 ports, any k >= 2) ----
 
-    def init_basic_ec_sw_recovery(self, rank: int, world_size: int,
-                                  failed_rank_in_group: int = 2) -> None:
+    def init_basic_ec_sw_recovery(
+        self, rank: int, world_size: int, failed_rank_in_group: int = 2
+    ) -> None:
         """Initialize generalized SW recovery with k-1 ports (one per non-local data block).
 
         Replaces init_basic_ec_load_software_only for k > 2.  Sets up dedicated
@@ -667,20 +677,24 @@ class BasicECManager:
         # Network config: k-1 consecutive ports after the save ports
         base_ip = resolve_ip("BASIC_EC", rank=rank, fallback_prefixes=["ECNAIVE"])
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
-        base_port = int(os.environ.get('BASIC_EC_BASE_PORT', os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000)))
+        base_port = int(
+            os.environ.get(
+                'BASIC_EC_BASE_PORT', os.environ.get('ECNAIVE_BASE_PORT', master_port + 10000)
+            )
+        )
         n = self.basic_ec_n
         group_id = self._get_group_id(rank, world_size)
         rank_in_group = self._get_rank_in_group(rank, world_size)
         failed_global_rank = (
             self._get_rank_by_group_position(group_id, failed_rank_in_group, world_size)
-            if world_size >= n else failed_rank_in_group
+            if world_size >= n
+            else failed_rank_in_group
         )
-        native.set_load_mode(
-            True, failed_global_rank, rank_in_group, is_software_only=True,
-        )
+        native.set_load_mode(True, failed_global_rank, rank_in_group, is_software_only=True)
         load_receiver_rank = (
             self._get_rank_by_group_position(group_id, failed_rank_in_group, world_size)
-            if world_size >= n else failed_rank_in_group
+            if world_size >= n
+            else failed_rank_in_group
         )
         # Place SW recovery ports after load ports: base + 1000 + group*100 + 100 (offset from load)
         sw_base = base_port + 1200 + group_id * 200
@@ -700,9 +714,16 @@ class BasicECManager:
         receiver_ip = rank_ips.get(load_receiver_rank, base_ip)
 
         connection_key = (
-            rank, world_size, self.basic_ec_k, self.basic_ec_n,
-            failed_rank_in_group, group_id, rank_in_group, receiver_ip,
-            tuple(sw_ports), self.use_rdma,
+            rank,
+            world_size,
+            self.basic_ec_k,
+            self.basic_ec_n,
+            failed_rank_in_group,
+            group_id,
+            rank_in_group,
+            receiver_ip,
+            tuple(sw_ports),
+            self.use_rdma,
             os.environ.get("BASIC_EC_INTERFACE", os.environ.get("ECNAIVE_INTERFACE")),
         )
         if self._sw_recovery_connection_key is not None:
@@ -719,32 +740,38 @@ class BasicECManager:
         logger.info("BasicEC software in-process connection cache=miss rank=%d", rank)
         # Phase 1: bind/listen (receiver) + RDMA CQs (all ranks)
         logger.debug(f"BasicEC: [Rank {rank}] SW recovery phase 1: {num_blocks} ports")
-        native.init_basic_ec_load_sw_bind_listen(
-            rank_in_group, receiver_ip, num_blocks, sw_ports)
+        native.init_basic_ec_load_sw_bind_listen(rank_in_group, receiver_ip, num_blocks, sw_ports)
         torch.distributed.barrier()
 
         # Phase 2: receiver accepts (blocking), senders each connect to exactly one port.
         # Non-participating ranks skip entirely — they have no data block for the failed rank.
         if rank_in_group == failed_rank_in_group:
-            logger.debug("BasicEC: [Rank %d] SW recovery phase 2: accepting %d connections",
-                        rank, num_blocks)
+            logger.debug(
+                "BasicEC: [Rank %d] SW recovery phase 2: accepting %d connections", rank, num_blocks
+            )
             native.init_basic_ec_load_sw_accept(rank_in_group, num_blocks)
         else:
             block_idx = self.get_sw_recovery_block_idx_for_sender(
-                rank_in_group, failed_rank_in_group=failed_rank_in_group)
+                rank_in_group, failed_rank_in_group=failed_rank_in_group
+            )
             if block_idx >= 0:
-                logger.debug("BasicEC: [Rank %d] SW recovery phase 2: connecting block_idx=%d "
-                            "port=%d", rank, block_idx, sw_ports[block_idx])
+                logger.debug(
+                    "BasicEC: [Rank %d] SW recovery phase 2: connecting block_idx=%d " "port=%d",
+                    rank,
+                    block_idx,
+                    sw_ports[block_idx],
+                )
                 native.init_basic_ec_load_sw_connect_one(
-                    rank_in_group, receiver_ip, block_idx, sw_ports[block_idx])
+                    rank_in_group, receiver_ip, block_idx, sw_ports[block_idx]
+                )
             else:
-                logger.debug("BasicEC: [Rank %d] SW recovery phase 2: no block, skipping",
-                            rank)
+                logger.debug("BasicEC: [Rank %d] SW recovery phase 2: no block, skipping", rank)
         torch.distributed.barrier()
         self._sw_recovery_connection_key = connection_key
         native.reset_load_timing_stats()
-        logger.debug("BasicEC: [Rank %d] SW recovery connections ready (%d blocks)",
-                    rank, num_blocks)
+        logger.debug(
+            "BasicEC: [Rank %d] SW recovery connections ready (%d blocks)", rank, num_blocks
+        )
 
     def get_sw_recovery_block_idx_for_sender(
         self, sender_rank_in_group: int, failed_rank_in_group: int = 2
@@ -770,7 +797,8 @@ class BasicECManager:
         j = block_idx + 1
         n = self.basic_ec_n
         group_id = self._get_group_id(
-            self._get_rank_by_group_position(0, failed_rank_in_group, world_size), world_size)
+            self._get_rank_by_group_position(0, failed_rank_in_group, world_size), world_size
+        )
         sender_rig = (failed_rank_in_group + j) % n
         return self._get_rank_by_group_position(group_id, sender_rig, world_size)
 
@@ -803,9 +831,7 @@ class BasicECManager:
         sources: List[Tuple[int, int, int]] = []
         for j in range(1, k):
             source_rig = (failed_rig + j) % n
-            source_global = self._get_rank_by_group_position(
-                group_id, source_rig, world_size
-            )
+            source_global = self._get_rank_by_group_position(group_id, source_rig, world_size)
             recv_slot = j - 1  # recv slot j-1 on source rank contains d_{f,j}
             sources.append((source_global, j, recv_slot))
 
@@ -837,9 +863,7 @@ class BasicECManager:
             raise ValueError("BasicEC recovery requires at least one failed rank")
         invalid = [rank for rank in failed_global_ranks if rank < 0 or rank >= world_size]
         if invalid:
-            raise ValueError(
-                f"BasicEC failed ranks {invalid} are outside [0, {world_size - 1}]"
-            )
+            raise ValueError(f"BasicEC failed ranks {invalid} are outside [0, {world_size - 1}]")
         failed_set = set(failed_global_ranks)
         group_counts: Dict[int, int] = {}
         for failed in failed_global_ranks:
@@ -890,9 +914,7 @@ class BasicECManager:
                 if source_global not in failed_set:
                     surviving.append((source_global, pname, -1, pname))
 
-            recv_block_recovery = self._compute_recv_block_recovery(
-                fr, failed_set, world_size
-            )
+            recv_block_recovery = self._compute_recv_block_recovery(fr, failed_set, world_size)
 
             result[fr] = {
                 'lost_positions': lost_positions,
@@ -953,17 +975,17 @@ class BasicECManager:
                 block_type = 'parity1'
                 recovery_method = 'encode'
 
-            owner_rank = self._get_rank_by_group_position(
-                group_id, owner_rig, world_size
+            owner_rank = self._get_rank_by_group_position(group_id, owner_rig, world_size)
+            recv_info.append(
+                {
+                    'recv_idx': recv_idx,
+                    'owner_rank': owner_rank,
+                    'owner_rig': owner_rig,
+                    'owner_is_failed': owner_rank in failed_set,
+                    'block_type': block_type,
+                    'recovery_method': recovery_method,
+                }
             )
-            recv_info.append({
-                'recv_idx': recv_idx,
-                'owner_rank': owner_rank,
-                'owner_rig': owner_rig,
-                'owner_is_failed': owner_rank in failed_set,
-                'block_type': block_type,
-                'recovery_method': recovery_method,
-            })
 
         return recv_info
 
@@ -1013,6 +1035,7 @@ class BasicECManager:
 
         try:
             from megatron.training import get_args as input_args
+
             args = input_args()
             self.use_basic_ec = args.use_basic_ec
             if not getattr(args, 'use_basic_ec', False):
@@ -1034,65 +1057,79 @@ class BasicECManager:
             # Check RDMA flag
             self.use_rdma = getattr(args, 'use_rdma', False)
             logger.debug(f"BasicEC: RDMA support {'enabled' if self.use_rdma else 'disabled'}")
-                
+
             # Check if distributed environment is initialized
             if not torch.distributed.is_initialized():
-                logger.warning("BasicEC: Distributed environment not initialized, skipping BasicEC initialization")
+                logger.warning(
+                    "BasicEC: Distributed environment not initialized, "
+                    "skipping BasicEC initialization"
+                )
                 return
-                
+
             # Initialize BasicEC C++ module
             self._init_basic_ec_native()
-            
+
             # Start persistent buffer poller thread
             # BasicEC does not use layerwise mode
             self._start_buffer_poller_thread()
-            
+
         except Exception as e:
             logger.warning(f"BasicEC: Failed to initialize during manager initialization: {e}")
             self._basic_ec_native = None
-    
+
     def _init_basic_ec_native(self):
         """Initialize BasicEC C++ native module."""
         basic_ec_native = None
         try:
             # Direct import .so file without modifying sys.path or affecting other packages
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            
+
             # Find .so file
             import glob as _glob_module
+
             so_files = _glob_module.glob(os.path.join(current_dir, "basic_ec_native*.so"))
-            
+
             if not so_files:
                 raise ImportError(f"No basic_ec_native.so file found in {current_dir}")
-            
+
             # Load .so file directly using importlib
             import importlib.util as _importlib_util
+
             so_path = so_files[0]
             spec = _importlib_util.spec_from_file_location("basic_ec_native", so_path)
             basic_ec_native = _importlib_util.module_from_spec(spec)
             spec.loader.exec_module(basic_ec_native)
             logger.debug(f"BasicEC: Loaded .so file from {so_path}")
-            
+
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
-            
+
             # BasicEC only uses ASIO (no NCCL support)
             # Create instance with error handling
             try:
                 # ===== ASIO Initialization Path =====
                 logger.debug(f"BasicEC: [Rank {rank}] Using ASIO for communication")
-                
+
                 # Get network configuration
                 net_config = self._get_basic_ec_network_config(rank, world_size)
-                
+
                 # Synchronize all ranks before creating C++ instances
-                logger.debug(f"BasicEC: [Rank {rank}] Synchronizing all ranks before creating C++ native module (ASIO)...")
+                logger.debug(
+                    f"BasicEC: [Rank {rank}] Synchronizing all ranks before creating "
+                    "C++ native module (ASIO)..."
+                )
                 torch.distributed.barrier()
-                logger.debug(f"BasicEC: [Rank {rank}] All ranks synchronized, creating C++ native module with ASIO...")
-                
+                logger.debug(
+                    f"BasicEC: [Rank {rank}] All ranks synchronized, creating C++ "
+                    "native module with ASIO..."
+                )
+
                 # Create C++ instance with ASIO parameters
-                logger.debug(f"BasicEC: Creating C++ native module with ASIO (this will block until ASIO connections are established)...")
-                
+                logger.debug(
+                    "BasicEC: Creating C++ native module with ASIO (this will block "
+                    "until ASIO connections are established)..."
+                )
+
                 # The native constructor receives variable-length ASIO endpoint
                 # lists, RDMA exchange port lists, RS k, transport mode, and the
                 # rank's position in its n = k + 2 group.
@@ -1122,7 +1159,6 @@ class BasicECManager:
                 #   - RDMA listen on local RDMA recv port: offset 2*(n-1) + j
 
                 send_partners = partner_ranks['send_partners']
-                recv_partners = partner_ranks['recv_partners']
                 num_channels = n - 1  # = k + 1 send channels = k + 1 recv channels
 
                 # Build send connection params: (partner_ip, partner_recv_port) for each channel
@@ -1135,73 +1171,93 @@ class BasicECManager:
 
                 # Build recv connection params: (local_ip, local_recv_port) for each channel
                 recv_ips = [net_config['my_ip']] * num_channels
-                recv_ports_local = net_config['ports']['recv_ports']  # list of local recv listen ports
+                recv_ports_local = net_config['ports'][
+                    'recv_ports'
+                ]  # list of local recv listen ports
 
-                # Build RDMA exchange params: (partner_rdma_recv_port, local_rdma_recv_port) for each channel
+                # Build partner and local RDMA exchange ports for each channel.
                 rdma_send_ports_to = []
                 rdma_recv_ports_local = net_config['ports']['rdma_recv_ports']
                 for j, target_r in enumerate(send_partners):
                     partner_port_base = _port_base_for_rank(target_r)
-                    rdma_send_ports_to.append(partner_port_base + 2 * (n - 1) + j)  # partner's rdma_recv_ports[j]
+                    rdma_send_ports_to.append(
+                        partner_port_base + 2 * (n - 1) + j
+                    )  # partner's rdma_recv_ports[j]
 
                 # Get rank_in_group for RDMA connection ordering
                 rank_in_group = self._get_rank_in_group(rank, world_size)
 
                 # Create C++ instance with generalized connection lists
                 self._basic_ec_native = basic_ec_native.BasicECNative(
-                    send_ips, send_ports_to,
-                    recv_ips, recv_ports_local,
-                    rdma_send_ports_to, rdma_recv_ports_local,
+                    send_ips,
+                    send_ports_to,
+                    recv_ips,
+                    recv_ports_local,
+                    rdma_send_ports_to,
+                    rdma_recv_ports_local,
                     self.basic_ec_k,
                     self.use_rdma,
-                    rank_in_group
+                    rank_in_group,
                 )
-                
+
                 # If we reach here, ASIO connections are ready and threads are running
-                logger.debug(f"BasicEC: C++ native module initialized successfully with ASIO (rank={rank}, world_size={world_size})")
-                
+                logger.debug(
+                    "BasicEC: C++ native module initialized successfully with ASIO "
+                    f"(rank={rank}, world_size={world_size})"
+                )
+
                 # Initialize BasicEC buffers
                 # BasicEC does not use layerwise mode
                 self._init_basic_ec_buffers()
-                
+
                 # Synchronize all ranks after RDMA/ASIO and buffers are ready
-                logger.debug(f"BasicEC: [Rank {rank}] Synchronizing all ranks after native module init...")
+                logger.debug(
+                    f"BasicEC: [Rank {rank}] Synchronizing all ranks after native module init..."
+                )
                 torch.distributed.barrier()
                 logger.debug(f"BasicEC: [Rank {rank}] All ranks synchronized after BasicEC init")
-        
+
             except Exception as e:
                 logger.warning(f"BasicEC: Failed to create C++ native module instance: {e}")
                 # Try to stop the pipeline if it was partially created
                 try:
                     if hasattr(self, '_basic_ec_native') and self._basic_ec_native is not None:
                         self._basic_ec_native.stop()
-                except:
-                    pass
+                except Exception:
+                    logger.debug(
+                        "BasicEC: Failed to stop partially initialized native module", exc_info=True
+                    )
                 self._basic_ec_native = None
                 raise e
-            
+
         except ImportError as e:
-            logger.warning(f"BasicEC: C++ native module not available: {e}, BasicEC functionality will not work")
+            logger.warning(
+                f"BasicEC: C++ native module not available: {e}; "
+                "BasicEC functionality will not work"
+            )
             self._basic_ec_native = None
         except Exception as e:
-            logger.warning(f"BasicEC: Failed to initialize C++ native module: {e}, BasicEC functionality will not work")
+            logger.warning(
+                f"BasicEC: Failed to initialize C++ native module: {e}; "
+                "BasicEC functionality will not work"
+            )
             self._basic_ec_native = None
-    
+
     def _init_basic_ec_buffers(self):
         """Initialize BasicEC buffers during C++ module initialization.
-        
+
         Only pooled data and parity buffers are allocated here. The strategy
         allocates one local and n - 1 received persistent blocks after metadata exchange.
         """
         rank = torch.distributed.get_rank()
         logger.debug("BasicEC: Initializing buffers for BasicEC (data and parity pools only)")
-        
+
         # Allocate data buffers for storing original tensor data
         self.basic_ec_data_buffers = self._allocate_data_buffers()
-        
+
         # Allocate parity buffers (pooled) for parity blocks
         self.basic_ec_parity_buffers = self._allocate_parity_buffers()
-        
+
         # Register buffers for RDMA if enabled
         if self.use_rdma and self._basic_ec_native is not None:
             logger.debug(f"BasicEC: [Rank {rank}] Registering data and parity buffers for RDMA...")
@@ -1210,24 +1266,30 @@ class BasicECManager:
             for buffer in self.basic_ec_parity_buffers:
                 self.register_buffer(buffer)
             logger.debug(f"BasicEC: [Rank {rank}] All pooled buffers registered for RDMA")
-        
+
         # Initialize free buffer queues
         self._free_data_buffer_queue = queue.Queue()
         for buffer in self.basic_ec_data_buffers:
             self._free_data_buffer_queue.put(int(buffer.data_ptr()))
-        
+
         self._free_parity_buffer_queue = queue.Queue()
         for buffer in self.basic_ec_parity_buffers:
             self._free_parity_buffer_queue.put(int(buffer.data_ptr()))
 
-        logger.debug(f"BasicEC: Buffer initialization completed - "
-                   f"Data buffers: {len(self.basic_ec_data_buffers)}, "
-                   f"Parity buffers: {len(self.basic_ec_parity_buffers)}")
-    
+        logger.debug(
+            f"BasicEC: Buffer initialization completed - "
+            f"Data buffers: {len(self.basic_ec_data_buffers)}, "
+            f"Parity buffers: {len(self.basic_ec_parity_buffers)}"
+        )
+
     def _allocate_data_buffers(self):
         """Allocate data buffers for storing original tensor data."""
-        logger.debug(f"BasicEC: Allocating data buffers ({self.basic_ec_data_buffers_count} buffers, {self.basic_ec_buffer_size // (1024*1024)}MB each)")
-        
+        logger.debug(
+            "BasicEC: Allocating data buffers (%d buffers, %dMB each)",
+            self.basic_ec_data_buffers_count,
+            self.basic_ec_buffer_size // (1024 * 1024),
+        )
+
         data_buffers = []
         for i in range(self.basic_ec_data_buffers_count):
             buffer = allocate_hugepage_tensor(
@@ -1237,14 +1299,18 @@ class BasicECManager:
             )
             data_buffers.append(buffer)
             logger.debug(f"BasicEC: Allocated data buffer {i}: {self.basic_ec_buffer_size} bytes")
-        
+
         logger.debug(f"BasicEC: Allocated {len(data_buffers)} data buffers")
         return data_buffers
-    
+
     def _allocate_parity_buffers(self):
         """Allocate parity buffers (pooled) for parity blocks."""
-        logger.debug(f"BasicEC: Allocating parity buffers ({self.basic_ec_parity_buffers_count} buffers, {self.basic_ec_buffer_size // (1024*1024)}MB each)")
-        
+        logger.debug(
+            "BasicEC: Allocating parity buffers (%d buffers, %dMB each)",
+            self.basic_ec_parity_buffers_count,
+            self.basic_ec_buffer_size // (1024 * 1024),
+        )
+
         parity_buffers = []
         for i in range(self.basic_ec_parity_buffers_count):
             buffer = allocate_hugepage_tensor(
@@ -1254,16 +1320,15 @@ class BasicECManager:
             )
             parity_buffers.append(buffer)
             logger.debug(f"BasicEC: Allocated parity buffer {i}: {self.basic_ec_buffer_size} bytes")
-        
+
         logger.debug(f"BasicEC: Allocated {len(parity_buffers)} parity buffers")
         return parity_buffers
-    
-    
+
     def _poll_and_release_buffers(self):
         """Poll C++ for buffers ready to be released and put them back to queues."""
         if self._basic_ec_native is None:
             return
-        
+
         # Get data buffers ready for release
         data_buffers = self._basic_ec_native.get_data_buffers_to_release()
         for data_addr in data_buffers:
@@ -1271,8 +1336,10 @@ class BasicECManager:
                 self._free_data_buffer_queue.put_nowait(data_addr)
                 # logger.debug(f"BasicEC: Released data buffer at address {data_addr}")
             except Exception:
-                logger.error(f"BasicEC: Data buffer queue is full, cannot release buffer {data_addr}")
-        
+                logger.error(
+                    f"BasicEC: Data buffer queue is full, cannot release buffer {data_addr}"
+                )
+
         # Get parity buffers ready for release
         parity_buffers = self._basic_ec_native.get_parity_buffers_to_release()
         for parity_addr in parity_buffers:
@@ -1280,23 +1347,25 @@ class BasicECManager:
                 self._free_parity_buffer_queue.put_nowait(parity_addr)
                 # logger.debug(f"BasicEC: Released parity buffer at address {parity_addr}")
             except Exception:
-                logger.error(f"BasicEC: Parity buffer queue is full, cannot release buffer {parity_addr}")
-    
+                logger.error(
+                    f"BasicEC: Parity buffer queue is full, cannot release buffer {parity_addr}"
+                )
+
     def _start_buffer_poller_thread(self):
         """Start a persistent background thread to poll and release buffers."""
         if hasattr(self, '_buffer_poller_thread') and self._buffer_poller_thread is not None:
             logger.warning("BasicEC: Buffer poller thread already started")
             return
-        
+
         # Create control events
         self._buffer_poller_stop_event = threading.Event()
         self._buffer_poller_active_event = threading.Event()
-        
+
         def buffer_poller_worker():
             """Persistent background thread that polls for buffer releases."""
             logger.debug("BasicEC: Buffer poller thread started")
             poll_count = 0
-            
+
             while not self._buffer_poller_stop_event.is_set():
                 # Only poll when active
                 if self._buffer_poller_active_event.is_set():
@@ -1304,29 +1373,30 @@ class BasicECManager:
                     poll_count += 1
                     if poll_count % 1000 == 0:
                         logger.debug(f"BasicEC: Buffer poller running (polled {poll_count} times)")
-                
+
                 # Sleep briefly to avoid busy waiting
                 from time import sleep
+
                 sleep(0.001)  # 1ms
-            
+
             logger.debug("BasicEC: Buffer poller thread stopping")
-        
+
         # Start the daemon thread
         self._buffer_poller_thread = threading.Thread(target=buffer_poller_worker, daemon=True)
         self._buffer_poller_thread.start()
         logger.debug("BasicEC: Buffer poller thread created and started")
-    
+
     def _stop_buffer_poller_thread(self):
         """Stop the persistent buffer poller thread."""
         if not hasattr(self, '_buffer_poller_thread') or self._buffer_poller_thread is None:
             return
-        
+
         logger.debug("BasicEC: Stopping buffer poller thread...")
-        
+
         # Signal the thread to stop
         if self._buffer_poller_stop_event:
             self._buffer_poller_stop_event.set()
-        
+
         # Wait for thread to finish
         if self._buffer_poller_thread.is_alive():
             self._buffer_poller_thread.join(timeout=2.0)
@@ -1334,23 +1404,23 @@ class BasicECManager:
                 logger.warning("BasicEC: Buffer poller thread did not stop in time")
             else:
                 logger.debug("BasicEC: Buffer poller thread stopped successfully")
-        
+
         self._buffer_poller_thread = None
         self._buffer_poller_stop_event = None
         self._buffer_poller_active_event = None
-    
+
     def get_basic_ec_buffers(self):
         """Get BasicEC buffers for FileSystemWriterAsync.
-        
+
         Returns pooled data and parity buffers. The strategy allocates one local
         and n - 1 received persistent blocks after metadata exchange.
-        
+
         Returns:
             Dict containing all buffer information, or None if not initialized
         """
         if self.basic_ec_data_buffers is None:
             return None
-        
+
         return {
             'data_buffers': self.basic_ec_data_buffers,
             'parity_buffers': self.basic_ec_parity_buffers,
@@ -1361,31 +1431,49 @@ class BasicECManager:
             'poll_and_release_buffers': self._poll_and_release_buffers,
             # Persistent local/received blocks are allocated by the strategy.
         }
-    
+
     def register_buffer(self, buffer: torch.Tensor):
         """Register buffer for RDMA operations (similar to Gemini).
-        
+
         Args:
             buffer: PyTorch tensor to register for RDMA
         """
         if not self.use_rdma or self._basic_ec_native is None:
             return
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         buffer_addr = buffer.data_ptr()
         buffer_size = buffer.numel() * buffer.element_size()
-        
+
         # Check if already registered
         if buffer_addr in self.registered_buffers:
-            logger.debug(f"BasicEC: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
+            logger.debug(
+                "BasicEC: [Rank %d] Buffer already registered at 0x%x (size: %.2f MB)",
+                rank,
+                buffer_addr,
+                buffer_size / (1024**2),
+            )
             return
-        
+
         try:
-            logger.debug(f"BasicEC: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (iteration {self.current_iteration})")
+            logger.debug(
+                "BasicEC: [Rank %d] Registering buffer at 0x%x, size: %.2f GB, "
+                "numel: %d, dtype: %s (iteration %d)",
+                rank,
+                buffer_addr,
+                buffer_size / (1024**3),
+                buffer.numel(),
+                buffer.dtype,
+                self.current_iteration,
+            )
             self._basic_ec_native.register_buffer(buffer_addr, buffer_size)
             self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
-            logger.debug(f"BasicEC: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
-            
+            logger.debug(
+                "BasicEC: [Rank %d] Buffer registered successfully (total registered: %d)",
+                rank,
+                len(self.registered_buffers),
+            )
+
             # Print all registered buffers
             logger.debug(f"BasicEC: [Rank {rank}] All registered buffers:")
             # for addr, (size, iteration) in self.registered_buffers.items():
@@ -1393,27 +1481,31 @@ class BasicECManager:
         except Exception as e:
             logger.error(f"BasicEC: [Rank {rank}] Failed to register buffer: {e}")
             raise
-    
+
     def unregister_buffer(self, buffer: torch.Tensor):
         """Unregister buffer from RDMA.
-        
+
         Args:
             buffer: PyTorch tensor to unregister
         """
         if not self.use_rdma or self._basic_ec_native is None:
             return
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         buffer_addr = buffer.data_ptr()
-        
+
         if buffer_addr not in self.registered_buffers:
             return
-        
+
         try:
             logger.debug(f"BasicEC: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
             self._basic_ec_native.unregister_buffer(buffer_addr)
             del self.registered_buffers[buffer_addr]
-            logger.debug(f"BasicEC: [Rank {rank}] Buffer unregistered successfully (remaining: {len(self.registered_buffers)})")
+            logger.debug(
+                "BasicEC: [Rank %d] Buffer unregistered successfully (remaining: %d)",
+                rank,
+                len(self.registered_buffers),
+            )
         except Exception as e:
             logger.error(f"BasicEC: [Rank {rank}] Failed to unregister buffer: {e}")
             raise
@@ -1457,9 +1549,9 @@ class BasicECManager:
                     f"count={count}, bytes={slice_bytes}"
                 )
             return [buf[:slice_bytes] for buf in cached]
-        slices = list(allocate_hugepage_slices(
-            slice_bytes, count, fallback_pin_memory=True, touch_pages=True,
-        ))
+        slices = list(
+            allocate_hugepage_slices(slice_bytes, count, fallback_pin_memory=True, touch_pages=True)
+        )
         if register and self.use_rdma:
             for buffer in slices:
                 self.register_buffer(buffer)
@@ -1483,12 +1575,10 @@ class BasicECManager:
                 buffer = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
             except Exception:
                 buffer = allocate_hugepage_tensor(
-                    size_bytes, fallback_pin_memory=True, touch_pages=True,
+                    size_bytes, fallback_pin_memory=True, touch_pages=True
                 )
         else:
-            buffer = allocate_hugepage_tensor(
-                size_bytes, fallback_pin_memory=pin, touch_pages=True,
-            )
+            buffer = allocate_hugepage_tensor(size_bytes, fallback_pin_memory=pin, touch_pages=True)
         if register and self.use_rdma:
             self.register_buffer(buffer)
         self._recovery_workspace[name] = buffer
@@ -1509,9 +1599,7 @@ class BasicECManager:
                 'own_data0', 'recv_0', ..., 'recv_{n-2}'.
         """
         self._recovered_blocks[rank] = blocks
-        logger.debug(
-            f"BasicEC: Stored {len(blocks)} recovered blocks for rank {rank}"
-        )
+        logger.debug(f"BasicEC: Stored {len(blocks)} recovered blocks for rank {rank}")
 
     def get_recovered_blocks(self, rank: int) -> Optional[Dict[str, torch.Tensor]]:
         """Get recovered checkpoint blocks for a rank, or None.
@@ -1534,7 +1622,6 @@ class BasicECManager:
             self._recovered_blocks.clear()
         else:
             self._recovered_blocks.pop(rank, None)
-
 
     def cleanup(self):
         """Cleanup BasicEC resources when manager is destroyed."""
@@ -1590,8 +1677,7 @@ class BasicECManager:
 
         except Exception as e:
             logger.warning(f"BasicEC: Error during manager cleanup: {e}")
-    
+
     def __del__(self):
         """Cleanup BasicEC resources when manager is destroyed."""
         self.cleanup()
-

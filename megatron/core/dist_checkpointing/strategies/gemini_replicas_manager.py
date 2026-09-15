@@ -3,16 +3,16 @@
 """Gemini Replicas manager for multi-replica data transfer with C++ ASIO or RDMA implementation."""
 
 import os
-import queue
 import threading
 from logging import getLogger
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
 
-from .state_dict_decomposer import DecomposedStateDict, TensorInfo, assign_tensor_offsets
-from .hugepage_alloc import allocate_hugepage_tensor
 from megatron.core.dist_checkpointing.strategies.network_utils import resolve_ip
+
+from .hugepage_alloc import allocate_hugepage_tensor
+from .state_dict_decomposer import DecomposedStateDict, TensorInfo, assign_tensor_offsets
 
 logger = getLogger(__name__)
 
@@ -22,6 +22,7 @@ PORT_STEP = 100
 def _gemini_replicas_debug_enabled() -> bool:
     try:
         from megatron.training import get_args
+
         return bool(getattr(get_args(), "gemini_replicas_debug", False))
     except Exception:
         return False
@@ -29,21 +30,21 @@ def _gemini_replicas_debug_enabled() -> bool:
 
 class GeminiReplicasManager:
     """Shared manager for Gemini Replicas multi-replica data transfer.
-    
+
     This class provides a singleton instance that manages:
     - Gemini Replicas C++ native module (_gemini_replicas_native) for ASIO or RDMA communication
     - Buffer allocation and management for multi-replica data exchange
     - Decomposed state dict for efficient GPU-to-CPU transfer
     - Buffer registration for RDMA (when use_rdma is enabled)
-    
+
     Unlike Gemini (2 replicas), this supports configurable number of replicas (default: 3)
     with round-robin placement strategy:
     - 3 replicas, 4 ranks: rank0 -> [0,1,2], rank1 -> [1,2,3], rank2 -> [2,3,0], rank3 -> [3,0,1]
     """
-    
+
     _instance: Optional['GeminiReplicasManager'] = None
     _lock = threading.Lock()
-    
+
     def __new__(cls):
         """Singleton pattern to ensure only one instance exists."""
         if cls._instance is None:
@@ -52,12 +53,12 @@ class GeminiReplicasManager:
                     cls._instance = super().__new__(cls)
                     cls._instance._initialized = False
         return cls._instance
-    
+
     def __init__(self):
         """Initialize the manager (only once due to singleton)."""
         if hasattr(self, '_initialized') and self._initialized:
             return
-        
+
         self._gemini_replicas_native = None
         self.use_gemini_replicas = False
         self.use_gemini_replicas_optimized = False
@@ -66,21 +67,23 @@ class GeminiReplicasManager:
         self.gdr_available = False
         self.use_gdr = False
         self.channels_per_peer = 1
-        
+
         # Replica configuration
         self.num_replicas = 3  # Default: 3 replicas (including local)
-        self.group_size: Optional[int] = None  # None = global, int = independent groups of this size
-        
+        self.group_size: Optional[int] = (
+            None  # None = global, int = independent groups of this size
+        )
+
         # Buffer configuration
         self.gemini_replicas_pin_memory = True
         self.preallocated_cpu_buffer: Optional[torch.Tensor] = None
-        
+
         # Decomposed state dict for efficient transfer
         self.decomposed_state_dict: Optional[DecomposedStateDict] = None
-        
+
         # Target ranks for replicas (calculated based on round-robin)
         self.target_ranks: List[int] = []
-        
+
         # Python-side index of native RDMA registrations: address -> (size, marker).
         # The marker is caller-managed; this manager does not advance it.
         self.registered_buffers: Dict[int, Tuple[int, int]] = {}
@@ -97,7 +100,7 @@ class GeminiReplicasManager:
         self._recovery_topology_key: Optional[tuple] = None
 
         self._initialized = True
-    
+
     @staticmethod
     def _get_ranks_per_node() -> int:
         """Detect how many ranks run per node from environment variables.
@@ -191,8 +194,6 @@ class GeminiReplicasManager:
                 cluster_id = node_id % clusters
 
                 # group_id follows Concord: local_rank * clusters + cluster_id
-                group_id = local_rank * clusters + cluster_id
-
                 # Build ordered list of members in this group (rank_in_group 0..gs-1)
                 group_members = []
                 for pos in range(gs):
@@ -210,11 +211,6 @@ class GeminiReplicasManager:
                 for i in range(self.num_replicas):
                     targets.append(group_members[(my_pos + i) % len(group_members)])
 
-                # logger.info(
-                #     f"Gemini Replicas: [Rank {my_rank}] node-aware targets: {targets} "
-                #     f"({self.num_replicas} replicas, group_id={group_id}, "
-                #     f"members={group_members}, nodes/group={gs})"
-                # )
                 return targets
             else:
                 logger.warning(
@@ -313,20 +309,20 @@ class GeminiReplicasManager:
     def _get_gemini_replicas_network_config(self, rank: int, world_size: int) -> dict:
         """
         Get network configuration for Gemini Replicas ASIO connections.
-        
+
         Each rank needs to:
         1. Send data to (num_replicas - 1) target ranks
         2. Receive data from ranks that have this rank as target
-        
+
         Port allocation strategy:
         - Rank ``r`` owns the range beginning at ``base_port + r * PORT_STEP``.
         - ASIO listens on the first port in that range.
         - RDMA channel ``c`` listens at ``base_port + r * PORT_STEP + c``.
-        
+
         Args:
             rank (int): Current rank
             world_size (int): Total number of ranks
-            
+
         Returns:
             dict: Network configuration with keys:
                 - 'my_ip': str - This rank's IP address
@@ -344,12 +340,12 @@ class GeminiReplicasManager:
         # Step 2: Get the save-time base port.
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         base_port = int(os.environ.get('GEMINI_REPLICAS_BASE_PORT', master_port + 12000))
-        
+
         # Step 3: Calculate target and source ranks
         target_ranks_all = self._calculate_target_ranks(rank, world_size)
         # Remove self from targets (we don't send to ourselves)
         target_ranks = [r for r in target_ranks_all if r != rank]
-        
+
         # Calculate source ranks (ranks that have this rank as target)
         source_ranks = []
         for src_rank in range(world_size):
@@ -358,7 +354,7 @@ class GeminiReplicasManager:
             src_targets = self._calculate_target_ranks(src_rank, world_size)
             if rank in src_targets:
                 source_ranks.append(src_rank)
-        
+
         # Step 4: Reserve one fixed-size port range per rank.
         my_port_base = base_port + rank * PORT_STEP
         channels_per_peer = self.channels_per_peer if self.use_rdma else 1
@@ -371,35 +367,35 @@ class GeminiReplicasManager:
                 f"Gemini Replicas: channels_per_peer ({channels_per_peer}) exceeds "
                 f"the per-rank port range size ({PORT_STEP})"
             )
-        
+
         # Receive port: my_port_base (only one recv port for now, accepts connections sequentially)
         recv_port = my_port_base
         recv_ports = {src: recv_port for src in source_ranks}  # All sources connect to same port
-        
+
         # Send ports: connect to each target's recv port
         target_ports = []
         for target in target_ranks:
             port = base_port + target * PORT_STEP
             target_ports.append(port)
-        
+
         logger.debug(
             f"Gemini Replicas: [Rank {rank}] Port allocation:\n"
             f"  My port range: {my_port_base} - {my_port_base + PORT_STEP - 1}\n"
             f"  My recv port: {recv_port}\n"
             f"  Target ports: {target_ports}"
         )
-        
+
         # Step 5: Exchange IP addresses via torch.distributed.all_gather
         rank_ips = {}
-        
+
         if torch.distributed.is_initialized():
             try:
                 ip_list = [None] * world_size
                 torch.distributed.all_gather_object(ip_list, base_ip)
-                
+
                 for r, ip in enumerate(ip_list):
                     rank_ips[r] = ip
-                
+
                 logger.debug(
                     f"Gemini Replicas: [Rank {rank}] IP exchange completed - "
                     f"All rank IPs: {rank_ips}"
@@ -411,12 +407,14 @@ class GeminiReplicasManager:
                 for r in range(world_size):
                     rank_ips[r] = base_ip
         else:
-            logger.debug("Gemini Replicas: Distributed not initialized, using local IP for all ranks")
+            logger.debug(
+                "Gemini Replicas: Distributed not initialized, using local IP for all ranks"
+            )
             rank_ips[rank] = base_ip
-        
+
         # Prepare target IPs for C++ module
         target_ips = [rank_ips[r] for r in target_ranks]
-        
+
         config = {
             'my_ip': base_ip,
             'base_port': base_port,
@@ -428,7 +426,7 @@ class GeminiReplicasManager:
             'recv_ports': recv_ports,
             'channels_per_peer': channels_per_peer,
         }
-        
+
         logger.debug(
             f"Gemini Replicas: [Rank {rank}] Network config:\n"
             f"  My IP: {config['my_ip']}\n"
@@ -440,20 +438,23 @@ class GeminiReplicasManager:
             f"  Channels per peer: {config['channels_per_peer']}\n"
             f"  All rank IPs: {config['rank_ips']}"
         )
-        
+
         return config
-    
+
     def init_gemini_replicas_if_enabled(self, initialize_transport: bool = True):
         """Configure Gemini Replicas and optionally initialize its native transport."""
         if self._gemini_replicas_native is not None:
             logger.debug("Gemini Replicas: Already initialized, skipping")
             return
-        
+
         try:
             from megatron.training import get_args as input_args
+
             args = input_args()
             self.use_gemini_replicas = getattr(args, 'use_gemini_replicas', False)
-            self.use_gemini_replicas_optimized = getattr(args, 'use_gemini_replicas_optimized', False)
+            self.use_gemini_replicas_optimized = getattr(
+                args, 'use_gemini_replicas_optimized', False
+            )
             self.num_replicas = getattr(args, 'gemini_replicas_num', 3)
             self.group_size = getattr(args, 'gemini_replicas_group_size', None)
             self.use_rdma = getattr(args, 'use_rdma', False)
@@ -461,9 +462,7 @@ class GeminiReplicasManager:
             self.gdr_available = False
             self.use_gdr = False
             if self.gdr_requested and not self.use_rdma:
-                raise RuntimeError(
-                    "Gemini Replicas: --gemini-replicas-gdr requires --use-rdma"
-                )
+                raise RuntimeError("Gemini Replicas: --gemini-replicas-gdr requires --use-rdma")
             self.channels_per_peer = int(getattr(args, 'gemini_replicas_channels_per_peer', 1))
             if self.channels_per_peer < 1:
                 raise ValueError(
@@ -475,22 +474,25 @@ class GeminiReplicasManager:
                     "to RDMA save; ASIO will use one channel per peer"
                 )
                 self.channels_per_peer = 1
-            
+
             if not self.use_gemini_replicas or not self.use_gemini_replicas_optimized:
                 return
             if not initialize_transport:
                 return
-            
+
             # Check if distributed environment is initialized
             if not torch.distributed.is_initialized():
-                logger.warning("Gemini Replicas: Distributed environment not initialized, skipping initialization")
+                logger.warning(
+                    "Gemini Replicas: Distributed environment not initialized, "
+                    "skipping initialization"
+                )
                 return
-            
+
             self._prepare_native_reinit()
 
             # Initialize Gemini Replicas C++ module
             self._init_gemini_replicas_native()
-            
+
         except Exception as e:
             logger.error(f"Gemini Replicas: Failed to initialize: {e}")
             self._gemini_replicas_native = None
@@ -505,48 +507,59 @@ class GeminiReplicasManager:
 
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
-    
+
     def _init_gemini_replicas_native(self):
         """Initialize Gemini Replicas C++ native module with ASIO or RDMA."""
         gemini_replicas_native = None
         try:
             # Load .so file
             current_dir = os.path.dirname(os.path.abspath(__file__))
-            
+
             import glob as _glob_module
+
             so_files = _glob_module.glob(os.path.join(current_dir, "gemini_replicas_native*.so"))
-            
+
             if not so_files:
-                logger.warning(f"Gemini Replicas: No gemini_replicas_native.so file found in {current_dir}, will use fallback")
+                logger.warning(
+                    "Gemini Replicas: No gemini_replicas_native.so file found in "
+                    f"{current_dir}, will use fallback"
+                )
                 return
-            
+
             # Load .so file directly
             import importlib.util as _importlib_util
+
             so_path = so_files[0]
             spec = _importlib_util.spec_from_file_location("gemini_replicas_native", so_path)
             gemini_replicas_native = _importlib_util.module_from_spec(spec)
             spec.loader.exec_module(gemini_replicas_native)
             logger.debug(f"Gemini Replicas: Loaded .so file from {so_path}")
-            
+
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
-            
+
             # Get network configuration
             net_config = self._get_gemini_replicas_network_config(rank, world_size)
-            
+
             # Store target ranks for later use
             self.target_ranks = net_config['target_ranks']
-            
+
             # Synchronize all ranks before creating C++ instances
             mode_str = "RDMA" if self.use_rdma else "ASIO"
-            logger.debug(f"Gemini Replicas: [Rank {rank}] Synchronizing all ranks before creating C++ native module...")
+            logger.debug(
+                f"Gemini Replicas: [Rank {rank}] Synchronizing all ranks before "
+                "creating C++ native module..."
+            )
             torch.distributed.barrier()
-            logger.debug(f"Gemini Replicas: [Rank {rank}] All ranks synchronized, creating C++ native module with {mode_str}...")
-            
+            logger.debug(
+                f"Gemini Replicas: [Rank {rank}] All ranks synchronized, "
+                f"creating C++ native module with {mode_str}..."
+            )
+
             # Use the prepared target_ips and target_ports from config
             target_ips = net_config['target_ips']
             target_ports = net_config['target_ports']
-            
+
             # Get my recv port (all sources will connect to this port)
             recv_ports_list = list(net_config['recv_ports'].values())
             my_recv_port = (
@@ -554,15 +567,19 @@ class GeminiReplicasManager:
                 if recv_ports_list
                 else net_config['base_port'] + rank * PORT_STEP
             )
-            
+
             # Calculate number of source ranks
             num_source_ranks = len(net_config['source_ranks'])
-            
+
             # Create C++ instance (Phase 1: start acceptor only)
-            logger.debug(f"Gemini Replicas: Creating C++ native module with {mode_str} (Phase 1: acceptor)...")
-            
+            logger.debug(
+                "Gemini Replicas: Creating C++ native module with "
+                f"{mode_str} (Phase 1: acceptor)..."
+            )
+
             self._gemini_replicas_native = gemini_replicas_native.GeminiReplicasNative(
-                rank, world_size,
+                rank,
+                world_size,
                 net_config['target_ranks'],  # List of target ranks
                 target_ips,  # List of target IPs
                 target_ports,  # List of target ports
@@ -570,30 +587,35 @@ class GeminiReplicasManager:
                 my_recv_port,  # My recv port
                 num_source_ranks,  # Number of expected incoming connections
                 self.use_rdma,  # Use RDMA or ASIO
-                net_config['channels_per_peer']  # RDMA channels per peer
+                net_config['channels_per_peer'],  # RDMA channels per peer
             )
             if hasattr(self._gemini_replicas_native, "set_debug"):
                 self._gemini_replicas_native.set_debug(_gemini_replicas_debug_enabled())
-            
-            logger.debug(f"Gemini Replicas: C++ native module created (acceptor ready) for rank {rank}")
-            
+
+            logger.debug(
+                f"Gemini Replicas: C++ native module created (acceptor ready) for rank {rank}"
+            )
+
             # Synchronize all ranks before connecting (Phase 2)
             torch.distributed.barrier()
-            logger.debug(f"Gemini Replicas: [Rank {rank}] All ranks ready, starting Phase 2 (connecting)...")
-            
+            logger.debug(
+                f"Gemini Replicas: [Rank {rank}] All ranks ready, starting Phase 2 (connecting)..."
+            )
+
             # Phase 2: Connect to all targets
             self._gemini_replicas_native.finalize_connections()
 
             # Post-finalize barrier (aligned with BasicEC load: all TCP+RDMA ready)
             torch.distributed.barrier()
-            logger.debug(
-                f"Gemini Replicas: [Rank {rank}] All ranks finished Phase 2 connections"
-            )
+            logger.debug(f"Gemini Replicas: [Rank {rank}] All ranks finished Phase 2 connections")
 
             # Start persistent send/recv worker threads (like basic_ec)
             self._gemini_replicas_native.start_workers(net_config['source_ranks'])
 
-            logger.debug(f"Gemini Replicas: C++ native module fully initialized (rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})")
+            logger.debug(
+                "Gemini Replicas: C++ native module fully initialized "
+                f"(rank={rank}, targets={net_config['target_ranks']}, mode={mode_str})"
+            )
 
             # Preserve capability independently from the explicit save transport request.
             if self.use_rdma:
@@ -625,10 +647,11 @@ class GeminiReplicasManager:
                         f"Gemini Replicas: [Rank {rank}] GDR capability={self.gdr_available}, "
                         "save transport remains CPU"
                     )
-            
+
         except Exception as e:
             logger.error(f"Gemini Replicas: Failed to initialize C++ native module: {e}")
             import traceback
+
             traceback.print_exc()
             self._stop_native_gracefully()
             raise
@@ -636,37 +659,37 @@ class GeminiReplicasManager:
     def prepare_decomposed_state_dict(self, plan, planner):
         """
         Prepare decomposed state dict from SavePlan for efficient GPU-to-CPU transfer.
-        
+
         Similar to Gemini's prepare_decomposed_state_dict.
-        
+
         Args:
             plan: SavePlan from PyTorch distributed checkpoint
             planner: SavePlanner instance
         """
         from time import time
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         start = time()
-        
+
         logger.info(f"Gemini Replicas: [Rank {rank}] Preparing decomposed state dict from plan...")
-        
+
         # Extract tensor data from plan
         non_tensor_data = {}
         tensor_infos = []
         tensor_data_list = []
-        
+
         byte_io_count = 0
         tensor_count = 0
         none_data_count = 0
-        
+
         for item in plan.items:
             # Resolve data using planner
             data = planner.resolve_data(item)
-            
+
             if data is None:
                 none_data_count += 1
                 continue
-            
+
             if item.type == 1:  # WriteItemType.BYTE_IO
                 # Store non-tensor data
                 if hasattr(data, 'getvalue'):  # BytesIO object
@@ -686,21 +709,24 @@ class GeminiReplicasManager:
                     numel=data.numel(),
                     size_bytes=data.numel() * data.element_size(),
                     offset=0,  # Will be calculated below
-                    global_offset=tuple(item.index.offset) if hasattr(item.index, 'offset') else None,
+                    global_offset=(
+                        tuple(item.index.offset) if hasattr(item.index, 'offset') else None
+                    ),
                     shard_index=item.index.index if hasattr(item.index, 'index') else None,
                 )
                 tensor_infos.append(tensor_info)
                 tensor_data_list.append(data)
                 tensor_count += 1
-        
+
         logger.info(
-            f"Gemini Replicas: [Rank {rank}] Processed {byte_io_count} BytesIO items, {tensor_count} tensor items"
+            f"Gemini Replicas: [Rank {rank}] Processed {byte_io_count} BytesIO "
+            f"items, {tensor_count} tensor items"
             + (f", skipped {none_data_count} None items" if none_data_count > 0 else "")
         )
-        
+
         # Calculate aligned offsets for tensor data.
         total_tensor_size_bytes = assign_tensor_offsets(tensor_infos)
-        
+
         # Create decomposed structure
         self.decomposed_state_dict = DecomposedStateDict(
             non_tensor_data=non_tensor_data,
@@ -708,21 +734,24 @@ class GeminiReplicasManager:
             tensor_data=tensor_data_list,
             total_tensor_size_bytes=total_tensor_size_bytes,
         )
-        
+
         process_time = time() - start
-        
+
         # Log statistics
         stats = self.decomposed_state_dict.get_statistics()
         logger.info(
-            f"Gemini Replicas: [Rank {rank}] Prepared decomposed state dict in {process_time:.2f}s\n"
-            f"  Non-tensor data: {stats['non_tensor_size_bytes'] / 1024:.2f} KB\n"
-            f"  Tensor data: {stats['tensor_data_size_bytes'] / (1024**3):.2f} GB\n"
-            f"  Total tensors: {stats['num_tensors']}"
+            "Gemini Replicas: [Rank %d] Prepared decomposed state dict in %.2fs\n"
+            "  Non-tensor data: %.2f KB\n"
+            "  Tensor data: %.2f GB\n"
+            "  Total tensors: %d",
+            rank,
+            process_time,
+            stats['non_tensor_size_bytes'] / 1024,
+            stats['tensor_data_size_bytes'] / (1024**3),
+            stats['num_tensors'],
         )
-    
-    def allocate_preallocated_buffer(
-        self, size_bytes: int, prefer_torch_pinned: bool = False,
-    ):
+
+    def allocate_preallocated_buffer(self, size_bytes: int, prefer_torch_pinned: bool = False):
         """Allocate preallocated CPU buffer for data transfer.
 
         Args:
@@ -735,8 +764,7 @@ class GeminiReplicasManager:
             if self.preallocated_cpu_buffer.numel() >= size_bytes:
                 if _gemini_replicas_debug_enabled():
                     logger.info(
-                        f"Gemini Replicas: [Rank {rank}] Reusing existing "
-                        "preallocated buffer"
+                        f"Gemini Replicas: [Rank {rank}] Reusing existing " "preallocated buffer"
                     )
                 return
 
@@ -750,15 +778,13 @@ class GeminiReplicasManager:
         buffer = None
         if prefer_torch_pinned and pin:
             try:
-                buffer = torch.empty(
-                    size_bytes, dtype=torch.uint8, pin_memory=True,
-                )
+                buffer = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
             except Exception:
                 # Preserve the existing hugepage allocation as the fallback.
                 pass
         if buffer is None:
             buffer = allocate_hugepage_tensor(
-                size_bytes, fallback_pin_memory=pin, touch_pages=False,
+                size_bytes, fallback_pin_memory=pin, touch_pages=False
             )
         self.preallocated_cpu_buffer = buffer
         if _gemini_replicas_debug_enabled():
@@ -780,59 +806,71 @@ class GeminiReplicasManager:
         if cached is not None and cached.numel() >= size_bytes:
             return cached
         pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
-        buf = allocate_hugepage_tensor(
-            size_bytes, fallback_pin_memory=pin, touch_pages=False,
-        )
+        buf = allocate_hugepage_tensor(size_bytes, fallback_pin_memory=pin, touch_pages=False)
         self._cached_recv_buffers[src_rank] = buf
         return buf
 
     def register_buffer(self, buffer: torch.Tensor):
         """Register buffer for RDMA operations (called on first allocation in save phase).
-        
+
         Args:
             buffer: PyTorch tensor to register
         """
         if not self.use_rdma or self._gemini_replicas_native is None:
             return
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         buffer_addr = buffer.data_ptr()
         buffer_size = buffer.numel() * buffer.element_size()
-        
+
         # Check if already registered
         if buffer_addr in self.registered_buffers:
             if _gemini_replicas_debug_enabled():
-                logger.info(f"Gemini Replicas: [Rank {rank}] Buffer already registered at 0x{buffer_addr:x} (size: {buffer_size / (1024**2):.2f} MB)")
+                logger.info(
+                    f"Gemini Replicas: [Rank {rank}] Buffer already registered "
+                    f"at 0x{buffer_addr:x} "
+                    f"(size: {buffer_size / (1024**2):.2f} MB)"
+                )
             return
-        
+
         try:
             if _gemini_replicas_debug_enabled():
-                logger.info(f"Gemini Replicas: [Rank {rank}] Registering buffer at 0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, numel: {buffer.numel()}, dtype: {buffer.dtype} (marker {self.current_iteration})")
+                logger.info(
+                    f"Gemini Replicas: [Rank {rank}] Registering buffer at "
+                    f"0x{buffer_addr:x}, size: {buffer_size / (1024**3):.2f} GB, "
+                    f"numel: {buffer.numel()}, dtype: {buffer.dtype} "
+                    f"(marker {self.current_iteration})"
+                )
             self._gemini_replicas_native.register_buffer(buffer_addr, buffer_size)
             self.registered_buffers[buffer_addr] = (buffer_size, self.current_iteration)
             if _gemini_replicas_debug_enabled():
-                logger.info(f"Gemini Replicas: [Rank {rank}] Buffer registered successfully (total registered: {len(self.registered_buffers)})")
-            
+                logger.info(
+                    f"Gemini Replicas: [Rank {rank}] Buffer registered successfully "
+                    f"(total registered: {len(self.registered_buffers)})"
+                )
+
         except Exception as e:
             logger.error(f"Gemini Replicas: [Rank {rank}] Failed to register buffer: {e}")
             raise
-    
+
     def unregister_buffer(self, buffer: torch.Tensor):
         """Unregister buffer for RDMA operations.
-        
+
         Args:
             buffer: PyTorch tensor to unregister
         """
         if not self.use_rdma or self._gemini_replicas_native is None:
             return
-        
+
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         buffer_addr = buffer.data_ptr()
-        
+
         if buffer_addr not in self.registered_buffers:
-            logger.debug(f"Gemini Replicas: [Rank {rank}] Buffer not registered at 0x{buffer_addr:x}")
+            logger.debug(
+                f"Gemini Replicas: [Rank {rank}] Buffer not registered at 0x{buffer_addr:x}"
+            )
             return
-        
+
         try:
             logger.info(f"Gemini Replicas: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x}")
             self._gemini_replicas_native.unregister_buffer(buffer_addr)
@@ -840,7 +878,7 @@ class GeminiReplicasManager:
             logger.info(f"Gemini Replicas: [Rank {rank}] Buffer unregistered successfully")
         except Exception as e:
             logger.error(f"Gemini Replicas: [Rank {rank}] Failed to unregister buffer: {e}")
-    
+
     def get_native_module(self):
         """Get the C++ native module instance."""
         return self._gemini_replicas_native
@@ -850,11 +888,7 @@ class GeminiReplicasManager:
         return self._gemini_replicas_native is not None
 
     def send_to_rank(
-        self,
-        target_rank: int,
-        buffer: torch.Tensor,
-        *,
-        register: bool = True,
+        self, target_rank: int, buffer: torch.Tensor, *, register: bool = True
     ) -> None:
         """Directed P2P send to a single target rank for hardware recovery.
 
@@ -872,11 +906,7 @@ class GeminiReplicasManager:
                 "Gemini Replicas native module not initialized "
                 "— call init_gemini_replicas_if_enabled() first"
             )
-        if (
-            buffer.dtype == torch.uint8
-            and buffer.is_contiguous()
-            and buffer.dim() == 1
-        ):
+        if buffer.dtype == torch.uint8 and buffer.is_contiguous() and buffer.dim() == 1:
             buf = buffer
         else:
             buf = buffer.detach().contiguous().view(torch.uint8).reshape(-1)
@@ -885,10 +915,7 @@ class GeminiReplicasManager:
         native.send_to_rank(target_rank, int(buf.data_ptr()), buf.numel())
 
     def recv_from_rank(
-        self,
-        source_rank: int,
-        expected_size: int,
-        buffer: Optional[torch.Tensor] = None,
+        self, source_rank: int, expected_size: int, buffer: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Directed P2P recv from a specific source rank for hardware recovery.
 
@@ -911,7 +938,7 @@ class GeminiReplicasManager:
         if buffer is None:
             pin = self.gemini_replicas_pin_memory and torch.cuda.is_available()
             buf = allocate_hugepage_tensor(
-                expected_size, fallback_pin_memory=pin, touch_pages=False,
+                expected_size, fallback_pin_memory=pin, touch_pages=False
             )
             if self.use_rdma:
                 self.register_buffer(buf)
@@ -986,7 +1013,6 @@ class GeminiReplicasManager:
 
         return sorted(target_set), sorted(source_set)
 
-
     def recovery_workspace_matches(self, base_key: tuple) -> bool:
         """Return whether cached planning and buffers belong to this base identity."""
         return self._recovery_workspace_base_key == base_key
@@ -998,9 +1024,7 @@ class GeminiReplicasManager:
         self._recovery_workspace_base_key = base_key
         self._recovery_workspace_size_key = size_key
 
-    def set_recovery_workspace_object(
-        self, base_key: tuple, name: tuple, value: Any,
-    ) -> None:
+    def set_recovery_workspace_object(self, base_key: tuple, name: tuple, value: Any) -> None:
         """Cache an arbitrary Python object without transport registration.
 
         Object insertion may precede ``begin_recovery_workspace``. The workspace
@@ -1011,21 +1035,14 @@ class GeminiReplicasManager:
     def get_recovery_workspace_object(self, base_key: tuple, name: tuple) -> Any:
         """Return an object cached for the requested recovery identity."""
         if self._recovery_workspace_base_key != base_key:
-            raise KeyError(
-                f"Recovery workspace identity mismatch for object {name!r}"
-            )
+            raise KeyError(f"Recovery workspace identity mismatch for object {name!r}")
         try:
             return self._recovery_workspace_objects[(base_key, name)]
         except KeyError as exc:
-            raise KeyError(
-                f"Recovery workspace object {name!r} is not cached"
-            ) from exc
+            raise KeyError(f"Recovery workspace object {name!r} is not cached") from exc
 
     def get_recovery_buffer(
-        self,
-        name: tuple,
-        size_bytes: int,
-        prefer_torch_pinned: bool = False,
+        self, name: tuple, size_bytes: int, prefer_torch_pinned: bool = False
     ) -> torch.Tensor:
         """Return registered, page-backed scratch owned only by the workspace."""
         cached = self._recovery_workspace_buffers.get(name)
@@ -1037,16 +1054,12 @@ class GeminiReplicasManager:
         buffer = None
         if prefer_torch_pinned and pin:
             try:
-                buffer = torch.empty(
-                    size_bytes, dtype=torch.uint8, pin_memory=True,
-                )
+                buffer = torch.empty(size_bytes, dtype=torch.uint8, pin_memory=True)
             except Exception:
                 # Preserve the existing hugepage allocation as the fallback.
                 pass
         if buffer is None:
-            buffer = allocate_hugepage_tensor(
-                size_bytes, fallback_pin_memory=pin, touch_pages=True,
-            )
+            buffer = allocate_hugepage_tensor(size_bytes, fallback_pin_memory=pin, touch_pages=True)
         if self.use_rdma:
             self.register_buffer(buffer)
         self._recovery_workspace_buffers[name] = buffer
@@ -1070,8 +1083,9 @@ class GeminiReplicasManager:
                     self._gemini_replicas_native.unregister_buffer(buffer_addr)
                 except Exception as exc:
                     logger.warning(
-                        "Gemini Replicas: failed to unregister recovery buffer "
-                        "at 0x%x: %s", buffer_addr, exc,
+                        "Gemini Replicas: failed to unregister recovery buffer " "at 0x%x: %s",
+                        buffer_addr,
+                        exc,
                     )
             self.registered_buffers.clear()
             self._stop_native_gracefully()
@@ -1131,8 +1145,12 @@ class GeminiReplicasManager:
         participates = bool(failed_in_group and healthy_in_group)
         has_p2p_role = participates and bool(target_ranks or source_ranks)
         topology_key = (
-            rank, world_size, tuple(sorted(recovery_ranks)),
-            tuple(target_ranks), tuple(source_ranks), self.use_rdma,
+            rank,
+            world_size,
+            tuple(sorted(recovery_ranks)),
+            tuple(target_ranks),
+            tuple(source_ranks),
+            self.use_rdma,
             self.channels_per_peer,
         )
         if reuse_connections and self._recovery_topology_key == topology_key:
@@ -1162,10 +1180,9 @@ class GeminiReplicasManager:
         base_ip = resolve_ip("GEMINI_REPLICAS", rank=rank)
         master_port = int(os.environ.get('MASTER_PORT', '6000'))
         # Recovery uses a separately configurable base port.
-        reco_base_port = int(os.environ.get(
-            'GEMINI_REPLICAS_RECOVERY_BASE_PORT',
-            master_port + 18500
-        ))
+        reco_base_port = int(
+            os.environ.get('GEMINI_REPLICAS_RECOVERY_BASE_PORT', master_port + 18500)
+        )
 
         # Exchange IPs — all ranks in this reinit wave must participate.
         rank_ips = {}
@@ -1209,17 +1226,15 @@ class GeminiReplicasManager:
 
             current_dir = os.path.dirname(os.path.abspath(__file__))
             import glob as _glob_module
-            so_files = _glob_module.glob(
-                os.path.join(current_dir, "gemini_replicas_native*.so")
-            )
+
+            so_files = _glob_module.glob(os.path.join(current_dir, "gemini_replicas_native*.so"))
             if not so_files:
                 logger.error("Gemini Replicas: No .so found for recovery reinit")
                 return
             import importlib.util as _importlib_util
+
             so_path = so_files[0]
-            spec = _importlib_util.spec_from_file_location(
-                "gemini_replicas_native", so_path
-            )
+            spec = _importlib_util.spec_from_file_location("gemini_replicas_native", so_path)
             gemini_replicas_native = _importlib_util.module_from_spec(spec)
             spec.loader.exec_module(gemini_replicas_native)
 
@@ -1231,10 +1246,16 @@ class GeminiReplicasManager:
             )
 
             self._gemini_replicas_native = gemini_replicas_native.GeminiReplicasNative(
-                rank, world_size,
-                target_ranks, target_ips, target_ports,
-                base_ip, recv_port, num_sources,
-                self.use_rdma, recovery_channels,
+                rank,
+                world_size,
+                target_ranks,
+                target_ips,
+                target_ports,
+                base_ip,
+                recv_port,
+                num_sources,
+                self.use_rdma,
+                recovery_channels,
             )
 
             # All acceptors must be listening before any rank connects.
@@ -1260,10 +1281,9 @@ class GeminiReplicasManager:
                 f"targets={target_ranks}, sources={source_ranks}"
             )
         except Exception as e:
-            logger.error(
-                f"Gemini Replicas: [Rank {rank}] recovery reinit failed: {e}"
-            )
+            logger.error(f"Gemini Replicas: [Rank {rank}] recovery reinit failed: {e}")
             import traceback
+
             traceback.print_exc()
             self._gemini_replicas_native = None
             raise
@@ -1276,10 +1296,16 @@ class GeminiReplicasManager:
         if self.use_rdma and self._gemini_replicas_native is not None:
             for buffer_addr in list(self.registered_buffers.keys()):
                 try:
-                    logger.info(f"Gemini Replicas: [Rank {rank}] Unregistering buffer at 0x{buffer_addr:x} during cleanup")
+                    logger.info(
+                        f"Gemini Replicas: [Rank {rank}] Unregistering buffer at "
+                        f"0x{buffer_addr:x} during cleanup"
+                    )
                     self._gemini_replicas_native.unregister_buffer(buffer_addr)
                 except Exception as e:
-                    logger.warning(f"Gemini Replicas: [Rank {rank}] Failed to unregister buffer during cleanup: {e}")
+                    logger.warning(
+                        f"Gemini Replicas: [Rank {rank}] Failed to unregister "
+                        f"buffer during cleanup: {e}"
+                    )
             self.registered_buffers.clear()
 
         # Delegate to the thorough shutdown path that stops workers before
@@ -1294,4 +1320,3 @@ class GeminiReplicasManager:
         self._recovery_workspace_base_key = None
         self._recovery_workspace_size_key = None
         self._recovery_topology_key = None
-

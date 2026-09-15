@@ -6,38 +6,33 @@ independently so per-layer data fits within SOURCE stripe capacity.
 """
 
 import copy
+import os
 import pickle
 import queue
-import os
 import re
 import struct
 import threading
 import time
+from dataclasses import dataclass
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import torch
-from dataclasses import dataclass
 
 from megatron.core.dist_checkpointing.strategies.concord_manager import (
     ConcordManager,
     StripePlan,
     StripeRole,
 )
-from megatron.core.dist_checkpointing.strategies.hugepage_alloc import (
-    allocate_hugepage_tensor,
-)
+from megatron.core.dist_checkpointing.strategies.hugepage_alloc import allocate_hugepage_tensor
 from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
-    decompose_state_dict,
-    decompose_state_dict_for_save,
     DecomposedStateDict,
-    TensorInfo,
-    TensorMetadata,
     assign_tensor_offsets,
-    tensor_layout_size,
-    reconstruct_state_dict,
+    decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
+    reconstruct_state_dict,
+    tensor_layout_size,
 )
 
 logger = getLogger(__name__)
@@ -76,6 +71,7 @@ _cached_all_optimizer_layer_maps = None
 def _concord_debug_enabled(default: bool = False) -> bool:
     try:
         from megatron.training import get_args
+
         return bool(getattr(get_args(), "concord_debug", default))
     except Exception:
         return bool(default)
@@ -95,9 +91,9 @@ def _extract_layer_idx(key: str) -> int:
 
 def _normalize_model_state_key(key: str) -> str:
     if key.startswith("model."):
-        key = key[len("model."):]
+        key = key[len("model.") :]
     if key.startswith("module."):
-        key = key[len("module."):]
+        key = key[len("module.") :]
     return key
 
 
@@ -105,7 +101,7 @@ def _canonical_concord_model_key(key: str) -> str:
     """Normalize model tensor keys to match decomposed FQN format (model.* prefix)."""
     key = str(key)
     if key.startswith("module."):
-        key = key[len("module."):]
+        key = key[len("module.") :]
     if not key.startswith("model."):
         key = f"model.{key}"
     return key
@@ -118,7 +114,7 @@ def _canonical_live_model_key(key: str) -> str:
         changed = False
         for prefix in ("model.", "module."):
             if key.startswith(prefix):
-                key = key[len(prefix):]
+                key = key[len(prefix) :]
                 changed = True
     return key
 
@@ -172,6 +168,7 @@ def _reset_concord_parity_completion_timing() -> None:
         _concord_parity_timing = {}
     try:
         from megatron.training.global_vars import clear_recovery_timing_summary
+
         clear_recovery_timing_summary("concord_parity_completion")
     except Exception:
         pass
@@ -180,19 +177,16 @@ def _reset_concord_parity_completion_timing() -> None:
 def _stash_concord_parity_completion_timing_locked() -> None:
     if not _concord_parity_timing.get("failed_rank", False):
         return
-    recovery_start_s = float(
-        _concord_parity_timing.get("recovery_start_s", 0.0) or 0.0
-    )
+    recovery_start_s = float(_concord_parity_timing.get("recovery_start_s", 0.0) or 0.0)
     first_microbatch_done_s = float(
         _concord_parity_timing.get("first_microbatch_done_s", 0.0) or 0.0
     )
-    parity_done_s = float(
-        _concord_parity_timing.get("parity_done_s", 0.0) or 0.0
-    )
+    parity_done_s = float(_concord_parity_timing.get("parity_done_s", 0.0) or 0.0)
     if recovery_start_s <= 0.0 or first_microbatch_done_s <= 0.0 or parity_done_s <= 0.0:
         return
     try:
         from megatron.training.global_vars import stash_recovery_timing_summary
+
         stash_recovery_timing_summary(
             "concord_parity_completion",
             {
@@ -200,9 +194,7 @@ def _stash_concord_parity_completion_timing_locked() -> None:
                 "failed_rank": True,
                 "generation": int(_concord_parity_timing.get("generation", -1)),
                 "rank": int(_concord_parity_timing.get("rank", -1)),
-                "recovery_start_to_parity_done_s": max(
-                    0.0, parity_done_s - recovery_start_s
-                ),
+                "recovery_start_to_parity_done_s": max(0.0, parity_done_s - recovery_start_s),
                 "first_microbatch_done_to_parity_done_s": max(
                     0.0, parity_done_s - first_microbatch_done_s
                 ),
@@ -216,9 +208,7 @@ def concord_record_first_microbatch_done(done_s: Optional[float] = None) -> None
     """Publish the first real forward return for the active recovery generation."""
     now = float(done_s) if done_s is not None else time.time()
     with _concord_parity_timing_lock:
-        if not _concord_parity_timing or not _concord_parity_timing.get(
-            "failed_rank", False
-        ):
+        if not _concord_parity_timing or not _concord_parity_timing.get("failed_rank", False):
             return
         if int(_concord_parity_timing.get("generation", -1)) != int(
             _concord_first_layer_generation
@@ -245,6 +235,7 @@ def _record_concord_parity_done() -> None:
 def _stash_concord_first_layer_milestones_locked() -> None:
     try:
         from megatron.training.global_vars import stash_recovery_timing_summary
+
         stash_recovery_timing_summary(
             "concord_first_layer_milestones", dict(_concord_first_layer_milestones)
         )
@@ -287,6 +278,7 @@ def _arm_concord_first_layer_cuda_timer() -> None:
     global _concord_first_layer_recovery_start_s, _concord_parity_timing
     try:
         from megatron.training.global_vars import get_recovery_to_forward_timer_start
+
         timer_start_s = get_recovery_to_forward_timer_start()
     except Exception:
         timer_start_s = 0.0
@@ -321,6 +313,7 @@ def _arm_concord_first_layer_cuda_timer() -> None:
         if failed_rank and _pending_recovery_parity_repair is not None:
             try:
                 from megatron.training.global_vars import stash_recovery_timing_summary
+
                 stash_recovery_timing_summary(
                     "concord_parity_completion",
                     {
@@ -334,9 +327,7 @@ def _arm_concord_first_layer_cuda_timer() -> None:
                 pass
 
 
-def _record_concord_first_layer_milestone(
-    name: str, layer_idx: int, elapsed_s: float
-) -> None:
+def _record_concord_first_layer_milestone(name: str, layer_idx: int, elapsed_s: float) -> None:
     with _concord_first_layer_milestones_lock:
         if layer_idx != _concord_first_layer_recovery_target_idx or elapsed_s < 0.0:
             return
@@ -351,11 +342,7 @@ def _record_concord_first_layer_milestone(
 
 
 def _stash_concord_first_layer_cuda_event(
-    name: str,
-    layer_idx: int,
-    event: torch.cuda.Event,
-    device_idx: int,
-    generation: int,
+    name: str, layer_idx: int, event: torch.cuda.Event, device_idx: int, generation: int
 ) -> None:
     """Register an event already recorded on the stream doing the measured work."""
     if layer_idx != _concord_first_layer_recovery_target_idx:
@@ -424,6 +411,7 @@ def _record_concord_first_layer_cuda_event(name: str, layer_idx: int) -> None:
 
 
 def resolve_concord_first_layer_cuda_events() -> None:
+    """Resolve pending CUDA events for first-layer recovery timing."""
     if _concord_first_layer_recovery_start_s is None:
         return
     with _concord_first_layer_milestones_lock:
@@ -461,15 +449,14 @@ def resolve_concord_first_layer_cuda_events() -> None:
         _stash_concord_first_layer_milestones_locked()
 
 
-def _record_concord_native_batch_milestones(
-    native, batch_id: int, layer_idx: int
-) -> None:
+def _record_concord_native_batch_milestones(native, batch_id: int, layer_idx: int) -> None:
     if layer_idx != _concord_first_layer_recovery_target_idx:
         native.get_recovery_batch_milestones(batch_id)
         return
     milestones = dict(native.get_recovery_batch_milestones(batch_id))
     try:
         from megatron.training.global_vars import get_recovery_to_forward_timer_start
+
         timer_start_s = get_recovery_to_forward_timer_start()
     except Exception:
         timer_start_s = 0.0
@@ -494,6 +481,7 @@ def _record_concord_native_batch_milestones(
 def _get_concord_failed_ranks() -> Set[int]:
     try:
         from megatron.training import get_args
+
         args = get_args()
     except Exception:
         return set()
@@ -511,7 +499,9 @@ def _get_concord_failed_ranks() -> Set[int]:
 
 
 def record_concord_first_layer_forward_done(layer_idx: int) -> None:
+    """Record completion of the first recovered layer forward pass."""
     _record_concord_first_layer_cuda_event("forward_done_s", layer_idx)
+
 
 def _concord_recovery_profile(role: str, event: str, **fields) -> None:
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -545,14 +535,12 @@ def _concord_recovery_role(
 
 
 def _classify_concord_tensor(
-    key: str,
-    optimizer_layer_map: Optional[Dict[str, int]] = None,
+    key: str, optimizer_layer_map: Optional[Dict[str, int]] = None
 ) -> _TensorOwnership:
     layer_idx = _extract_layer_idx(key)
     if key.startswith("model.") or key == "model":
         return _TensorOwnership(
-            layer_idx=layer_idx,
-            kind="model_layer" if layer_idx >= 0 else "model_common",
+            layer_idx=layer_idx, kind="model_layer" if layer_idx >= 0 else "model_common"
         )
     if key.startswith("optimizer."):
         mapped_layer = -1
@@ -571,9 +559,7 @@ _PARAM_GROUP_ID_KEYS = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decouple
 
 
 def _model_tensor_param_group_key(
-    key: str,
-    tensor: torch.Tensor,
-    default_skip_embedding_weight_decay: bool = False,
+    key: str, tensor: torch.Tensor, default_skip_embedding_weight_decay: bool = False
 ) -> Tuple[float, float, bool, bool]:
     """Approximate Megatron param-group bucket for a model tensor key."""
     no_wd = (
@@ -602,9 +588,7 @@ def _resolve_optimizer_distribute_target(
     return None
 
 
-def _optimizer_keys_for_index(
-    group_idx: int, param_idx: int, state_index: int,
-) -> List[str]:
+def _optimizer_keys_for_index(group_idx: int, param_idx: int, state_index: int) -> List[str]:
     """Build decomposed optimizer keys using global Adam state indices."""
     state_prefix = f"optimizer.optimizer.state.{state_index}"
     return [
@@ -657,7 +641,7 @@ def _ordered_model_keys_for_fp32_params(
 
 
 def _iter_optimizer_model_param_entries(
-    state_dict: Dict[str, Any],
+    state_dict: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], List[Tuple[str, int, List[str]]]]:
     """Map optimizer tensors to model tensor keys via fp32 master weights."""
     model_sd = state_dict.get("model")
@@ -682,13 +666,14 @@ def _iter_optimizer_model_param_entries(
     if fp32_groups is None:
         logger.warning(
             "Concord optimizer map: missing fp32_from_fp16_params; "
-            "optimizer-common distribution will be incomplete",
+            "optimizer-common distribution will be incomplete"
         )
         return optim_sd, []
     if len(fp32_groups) != len(param_groups):
         logger.warning(
             "Concord optimizer map: fp32 group count (%d) != param_groups (%d)",
-            len(fp32_groups), len(param_groups),
+            len(fp32_groups),
+            len(param_groups),
         )
         return optim_sd, []
 
@@ -697,18 +682,14 @@ def _iter_optimizer_model_param_entries(
         for param_idx, fp32_tensor in enumerate(fp32_group):
             flat_fp32.append((group_idx, param_idx, fp32_tensor))
 
-    ordered_model_keys = _ordered_model_keys_for_fp32_params(
-        model_param_entries, flat_fp32,
-    )
+    ordered_model_keys = _ordered_model_keys_for_fp32_params(model_param_entries, flat_fp32)
 
     model_buckets: Dict[Tuple[float, float, bool, bool], List[Tuple[str, int, torch.Tensor]]] = {}
     for key, tensor, layer_idx in model_param_entries:
         bucket_key = _model_tensor_param_group_key(key, tensor)
         model_buckets.setdefault(bucket_key, []).append((key, layer_idx, tensor))
 
-    bucket_cursor: Dict[Tuple[float, float, bool, bool], int] = {
-        key: 0 for key in model_buckets
-    }
+    bucket_cursor: Dict[Tuple[float, float, bool, bool], int] = {key: 0 for key in model_buckets}
     entries: List[Tuple[str, int, List[str]]] = []
     state_index = 0
     ordered_cursor = 0
@@ -717,14 +698,15 @@ def _iter_optimizer_model_param_entries(
         if not isinstance(group, dict):
             continue
         pg_key = tuple(
-            group.get(key, False if key.startswith("is_") else 1.0)
-            for key in _PARAM_GROUP_ID_KEYS
+            group.get(key, False if key.startswith("is_") else 1.0) for key in _PARAM_GROUP_ID_KEYS
         )
         fp32_group = fp32_groups[group_idx]
         if len(fp32_group) != len(group.get("params", [])):
             logger.warning(
                 "Concord optimizer map: group %d fp32 params (%d) != param_groups params (%d)",
-                group_idx, len(fp32_group), len(group.get("params", [])),
+                group_idx,
+                len(fp32_group),
+                len(group.get("params", [])),
             )
 
         for param_idx, fp32_tensor in enumerate(fp32_group):
@@ -763,11 +745,13 @@ def _iter_optimizer_model_param_entries(
                         break
 
             if model_key is not None:
-                entries.append((
-                    model_key,
-                    layer_idx,
-                    _optimizer_keys_for_index(group_idx, param_idx, state_index),
-                ))
+                entries.append(
+                    (
+                        model_key,
+                        layer_idx,
+                        _optimizer_keys_for_index(group_idx, param_idx, state_index),
+                    )
+                )
             state_index += 1
 
     return optim_sd, entries
@@ -808,6 +792,7 @@ class _LayerGroup:
 @dataclass
 class _RecoveryBufPool:
     """Reusable RDMA buffers sized to max per-layer block_size for this rank."""
+
     decoder_recv_bufs: List[torch.Tensor]
     decoder_recv_buf_slots: List[List[torch.Tensor]]
     failed_recv_buf: Optional[torch.Tensor]
@@ -836,6 +821,7 @@ class _LayerEncodeResult:
 @dataclass
 class _LayerEncodeSubmitState:
     """Per-layer source-address state retained until native batch submission."""
+
     layer_name: str
     layer_idx: int
     block_size: int
@@ -850,6 +836,7 @@ class _LayerEncodeSubmitState:
 @dataclass
 class _ConcordLayerReadyRecord:
     """Per-layer recovery readiness exported to the forward path."""
+
     layer_name: str
     layer_idx: int
     encode_iter: int
@@ -883,6 +870,7 @@ class _ConcordCommonReadiness:
             self.ready.set()
 
     def publish(self, tensors: Optional[Dict[str, torch.Tensor]]) -> None:
+        """Publish newly recovered common tensors."""
         if not tensors:
             return
         with self._lock:
@@ -894,12 +882,14 @@ class _ConcordCommonReadiness:
                 self.ready.set()
 
     def fail(self, error: BaseException) -> None:
+        """Publish a terminal common-state recovery error."""
         with self._lock:
             if self.error is None:
                 self.error = error
             self.ready.set()
 
     def finish(self) -> None:
+        """Mark common-state publication as complete."""
         with self._lock:
             if self.snapshot is not None or self.error is not None:
                 return
@@ -911,6 +901,7 @@ class _ConcordCommonReadiness:
             self.ready.set()
 
     def wait_snapshot(self) -> Dict[str, torch.Tensor]:
+        """Wait for and return the complete common-state snapshot."""
         self.ready.wait()
         with self._lock:
             if self.error is not None:
@@ -988,12 +979,7 @@ def _sort_recovery_jobs_by_forward_priority(
     jobs: List[_ConcordLayerRecoveryJob],
 ) -> List[_ConcordLayerRecoveryJob]:
     return sorted(
-        jobs,
-        key=lambda job: (
-            0 if job.layer_idx < 0 else 1,
-            job.layer_idx,
-            job.encode_iter,
-        ),
+        jobs, key=lambda job: (0 if job.layer_idx < 0 else 1, job.layer_idx, job.encode_iter)
     )
 
 
@@ -1064,6 +1050,7 @@ class _ConcordLayerwiseRuntime:
         self._forward_event_wait_layer_indices: Set[int] = set()
 
     def attach_model_state_keys(self, model_state_keys) -> None:
+        """Index model state keys by transformer layer."""
         keys_by_layer: Dict[int, Set[str]] = {}
         for key in model_state_keys:
             layer_idx = _extract_layer_idx(str(key))
@@ -1073,20 +1060,16 @@ class _ConcordLayerwiseRuntime:
             self._model_keys_by_layer = keys_by_layer
 
     def attach_live_model(self, model) -> None:
+        """Index live model tensors for layerwise injection."""
         live_tensors: Dict[str, torch.Tensor] = {}
         canonical_live_tensors: Dict[str, torch.Tensor] = {}
 
         def register_live_tensor(name: str, tensor: torch.Tensor) -> None:
-            variants = {
-                str(name),
-                _canonical_live_model_key(name),
-            }
+            variants = {str(name), _canonical_live_model_key(name)}
             for variant in variants:
                 if variant:
                     live_tensors.setdefault(variant, tensor)
-                    canonical_live_tensors.setdefault(
-                        _canonical_live_model_key(variant), tensor
-                    )
+                    canonical_live_tensors.setdefault(_canonical_live_model_key(variant), tensor)
 
         modules = model if isinstance(model, (list, tuple)) else [model]
         for module in modules:
@@ -1126,7 +1109,7 @@ class _ConcordLayerwiseRuntime:
         tensors = record.model_tensors
         if not tensors and record.tensors:
             tensors, _ = _split_recovered_tensors(
-                record.tensors, record.model_tensor_keys, record.optimizer_tensor_keys,
+                record.tensors, record.model_tensor_keys, record.optimizer_tensor_keys
             )
         return tensors
 
@@ -1134,9 +1117,7 @@ class _ConcordLayerwiseRuntime:
         record.model_tensors = None
         if record.optimizer_tensors is None and record.tensors is not None:
             _, optimizer_tensors = _split_recovered_tensors(
-                record.tensors,
-                record.model_tensor_keys,
-                record.optimizer_tensor_keys,
+                record.tensors, record.model_tensor_keys, record.optimizer_tensor_keys
             )
             record.optimizer_tensors = optimizer_tensors
         record.tensors = record.optimizer_tensors if record.contains_optimizer_state else None
@@ -1227,7 +1208,7 @@ class _ConcordLayerwiseRuntime:
         self._release_injected_record_tensors(record)
         if layer_idx == _concord_first_layer_recovery_target_idx:
             _stash_concord_first_layer_cuda_event(
-                "h2d_s", layer_idx, completion, device_idx, milestone_generation,
+                "h2d_s", layer_idx, completion, device_idx, milestone_generation
             )
         return True
 
@@ -1257,9 +1238,7 @@ class _ConcordLayerwiseRuntime:
                         continue
                     nbytes = tensor.numel() * tensor.element_size()
                     source_is_cpu = tensor.device.type == "cpu"
-                    source_is_contiguous = (
-                        tensor.layout == torch.strided and tensor.is_contiguous()
-                    )
+                    source_is_contiguous = tensor.layout == torch.strided and tensor.is_contiguous()
                     if source_is_contiguous:
                         self.inject_contiguous_tensors += 1
                     else:
@@ -1285,7 +1264,9 @@ class _ConcordLayerwiseRuntime:
                         if fallback_device_idx not in self._model_h2d_start_events_by_device:
                             start_event = torch.cuda.Event(enable_timing=True)
                             start_event.record(stream)
-                            self._model_h2d_start_events_by_device[fallback_device_idx] = start_event
+                            self._model_h2d_start_events_by_device[fallback_device_idx] = (
+                                start_event
+                            )
                     if direct_copy:
                         dst.copy_(tensor, non_blocking=True)
                         self.inject_direct_tensors += 1
@@ -1298,9 +1279,7 @@ class _ConcordLayerwiseRuntime:
             if matched > 0 and fallback_device_idx is not None:
                 completion_event = torch.cuda.Event(enable_timing=True)
                 completion_event.record(torch.cuda.current_stream(fallback_device_idx))
-                self._model_h2d_completion_events.append(
-                    (fallback_device_idx, completion_event)
-                )
+                self._model_h2d_completion_events.append((fallback_device_idx, completion_event))
                 self.model_h2d_timed_layers += 1
             if layer_idx == _concord_first_layer_recovery_target_idx and matched > 0:
                 _record_concord_first_layer_cuda_event("h2d_s", layer_idx)
@@ -1317,6 +1296,7 @@ class _ConcordLayerwiseRuntime:
         model_tensors: Optional[Dict[str, torch.Tensor]] = None,
         error: str = "",
     ) -> None:
+        """Publish recovered model tensors for one layer."""
         record = self._records_by_layer.get(layer_idx)
         if record is None:
             return
@@ -1338,8 +1318,11 @@ class _ConcordLayerwiseRuntime:
             event = self._model_events_by_layer.setdefault(layer_idx, threading.Event())
             event.set()
         _concord_recovery_profile(
-            "runtime", "model_ready_done", layer=record.layer_name,
-            layer_idx=layer_idx, model_tensors=len(model_tensors or {}),
+            "runtime",
+            "model_ready_done",
+            layer=record.layer_name,
+            layer_idx=layer_idx,
+            model_tensors=len(model_tensors or {}),
             error=error or "none",
         )
 
@@ -1349,6 +1332,7 @@ class _ConcordLayerwiseRuntime:
         optimizer_tensors: Optional[Dict[str, torch.Tensor]] = None,
         error: str = "",
     ) -> None:
+        """Publish recovered optimizer tensors for one layer."""
         record = self._records_by_layer.get(layer_idx)
         if record is None:
             return
@@ -1363,7 +1347,9 @@ class _ConcordLayerwiseRuntime:
             event = self._optimizer_events_by_layer.setdefault(layer_idx, threading.Event())
             event.set()
         _concord_recovery_profile(
-            "runtime", "optimizer_ready_done", layer=record.layer_name,
+            "runtime",
+            "optimizer_ready_done",
+            layer=record.layer_name,
             layer_idx=layer_idx,
             optimizer_tensors=len(optimizer_tensors or {}),
             error=error or "none",
@@ -1377,11 +1363,12 @@ class _ConcordLayerwiseRuntime:
         tensors: Optional[Dict[str, torch.Tensor]] = None,
         error: str = "",
     ) -> None:
+        """Publish all recovered tensors for one layer."""
         record = self._records_by_layer.get(layer_idx)
         if record is None:
             return
         model_tensors, optimizer_tensors = _split_recovered_tensors(
-            tensors, record.model_tensor_keys, record.optimizer_tensor_keys,
+            tensors, record.model_tensor_keys, record.optimizer_tensor_keys
         )
         self.mark_model_ready(
             layer_idx,
@@ -1396,10 +1383,12 @@ class _ConcordLayerwiseRuntime:
             self.mark_optimizer_ready(layer_idx, error=error)
 
     def mark_layer_error(self, layer_idx: int, error: str) -> None:
+        """Publish a recovery error for one layer."""
         self.mark_model_ready(layer_idx, error=error)
         self.mark_optimizer_ready(layer_idx, error=error)
 
     def wait_and_materialize_layer(self, layer_idx: int) -> bool:
+        """Wait for and inject one recovered model layer."""
         t0 = time.time()
         try:
             record = self._records_by_layer.get(layer_idx)
@@ -1436,10 +1425,14 @@ class _ConcordLayerwiseRuntime:
                 logger.debug(
                     "Concord layerwise forward: layer=%s idx=%d ready "
                     "recovery_materialize=%.4fs wait=%.4fs",
-                    record.layer_name, layer_idx, record.materialize_s, waited,
+                    record.layer_name,
+                    layer_idx,
+                    record.materialize_s,
+                    waited,
                 )
                 try:
                     from megatron.training.global_vars import mark_recovery_to_forward_timer
+
                     mark_recovery_to_forward_timer(f"{record.layer_name}_forward_ready")
                 except Exception:
                     pass
@@ -1449,6 +1442,7 @@ class _ConcordLayerwiseRuntime:
                 self.wait_s += time.time() - t0
 
     def wait_for_optimizer_layers(self) -> None:
+        """Wait until all required optimizer layers are recovered."""
         t0 = time.time()
         try:
             for layer_idx, record in sorted(self._records_by_layer.items()):
@@ -1486,10 +1480,7 @@ class _ConcordLayerwiseRuntime:
                 completion.synchronize()
                 span_s = max(span_s, float(copy_start.elapsed_time(completion)) / 1000.0)
                 if recovery_start is not None:
-                    done_s = max(
-                        done_s,
-                        float(recovery_start.elapsed_time(completion)) / 1000.0,
-                    )
+                    done_s = max(done_s, float(recovery_start.elapsed_time(completion)) / 1000.0)
             except Exception:
                 continue
         with self._runtime_lock:
@@ -1497,6 +1488,7 @@ class _ConcordLayerwiseRuntime:
             self.model_h2d_done_s = done_s
         try:
             from megatron.training.global_vars import stash_recovery_timing_summary
+
             stash_recovery_timing_summary(
                 "concord_model_h2d",
                 {
@@ -1511,6 +1503,7 @@ class _ConcordLayerwiseRuntime:
             pass
 
     def summary(self) -> Dict[str, Any]:
+        """Return layerwise recovery runtime statistics."""
         with self._runtime_lock:
             pending_runtime_tensors = sum(
                 len(record.model_tensors or {})
@@ -1584,6 +1577,7 @@ class _ConcordRecoveryService:
         self.safe_point_teardown_done: bool = False
 
     def reset_for_load(self, role: str) -> None:
+        """Reset recovery service state for a new load."""
         global _active_layerwise_runtime, _active_recovery_worker
         global _recovery_async_parity_submitted
         global _recovery_async_parity_thread, _recovery_async_parity_error
@@ -1620,22 +1614,22 @@ class _ConcordRecoveryService:
         _concord_recovery_profile(self.role, "service_reset", state=self.state)
 
     def attach_runtime(self, runtime: Optional[_ConcordLayerwiseRuntime]) -> None:
+        """Attach the active layerwise recovery runtime."""
         self.runtime = runtime
         if runtime is not None and self.state == self.INIT:
             self.state = self.COMMON_READY
         _concord_recovery_profile(
-            self.role, "service_attach_runtime",
-            state=self.state, has_runtime=runtime is not None,
+            self.role, "service_attach_runtime", state=self.state, has_runtime=runtime is not None
         )
 
     def attach_worker(self, worker: Optional[threading.Thread]) -> None:
+        """Attach the active asynchronous recovery worker."""
         self.worker = worker
         if worker is not None:
             self.state = self.LAYERS_RUNNING
             self.role = getattr(worker, "_concord_recovery_role", self.role)
         _concord_recovery_profile(
-            self.role, "service_attach_worker",
-            state=self.state, has_worker=worker is not None,
+            self.role, "service_attach_worker", state=self.state, has_worker=worker is not None
         )
 
     def _check_worker_error(self) -> None:
@@ -1650,6 +1644,7 @@ class _ConcordRecoveryService:
             raise RuntimeError("Concord async recovery worker failed") from self.error
 
     def wait_all(self, reason: str = "explicit") -> None:
+        """Wait for all asynchronous recovery work to finish."""
         worker = self.worker
         if worker is not None and worker.is_alive():
             role = getattr(worker, "_concord_recovery_role", self.role)
@@ -1660,8 +1655,7 @@ class _ConcordRecoveryService:
                 logger.debug("Concord: waiting for async recovery worker to finish (%s)", reason)
             worker.join()
             _concord_recovery_profile(
-                role, "join_wait_done", jobs=jobs,
-                elapsed_s=time.time() - t_join, reason=reason,
+                role, "join_wait_done", jobs=jobs, elapsed_s=time.time() - t_join, reason=reason
             )
         self._check_worker_error()
         self.worker = None
@@ -1669,11 +1663,13 @@ class _ConcordRecoveryService:
             self.state = self.DONE
 
     def wait_layer(self, layer_idx: int) -> bool:
+        """Wait for and materialize one recovered layer."""
         if self.runtime is None:
             return False
         return self.runtime.wait_and_materialize_layer(layer_idx)
 
     def wait_optimizer(self) -> bool:
+        """Wait for optimizer recovery to finish."""
         if self.runtime is None:
             return False
         self.runtime.wait_for_optimizer_layers()
@@ -1683,6 +1679,7 @@ class _ConcordRecoveryService:
         return True
 
     def summary(self) -> Dict[str, Any]:
+        """Return the current recovery service status."""
         runtime_summary = None if self.runtime is None else self.runtime.summary()
         worker_alive = self.worker is not None and self.worker.is_alive()
         return {
@@ -1723,9 +1720,7 @@ def _get_active_concord_recovery_service() -> _ConcordRecoveryService:
     return _active_recovery_service
 
 
-def _set_active_concord_layerwise_runtime(
-    runtime: Optional[_ConcordLayerwiseRuntime],
-) -> None:
+def _set_active_concord_layerwise_runtime(runtime: Optional[_ConcordLayerwiseRuntime]) -> None:
     global _active_layerwise_runtime
     _active_layerwise_runtime = runtime
     _get_active_concord_recovery_service().attach_runtime(runtime)
@@ -1738,6 +1733,7 @@ def _set_active_concord_recovery_worker(worker: Optional[threading.Thread]) -> N
 
 
 def concord_wait_for_async_recovery() -> None:
+    """Wait for the active asynchronous Concord recovery."""
     global _active_recovery_worker
     service = _get_active_concord_recovery_service()
     service.wait_all(reason="explicit")
@@ -1761,11 +1757,7 @@ def _layerwise_record_from_layer_buf(
             layer_idx = int(layer_name.split("_", 1)[1])
         except (TypeError, ValueError):
             layer_idx = -1
-    tensor_keys = [
-        getattr(info, "key", "")
-        for info in layer_infos
-        if getattr(info, "key", "")
-    ]
+    tensor_keys = [getattr(info, "key", "") for info in layer_infos if getattr(info, "key", "")]
     model_tensor_keys = list(model_tensor_keys or [])
     optimizer_tensor_keys = list(optimizer_tensor_keys or [])
     if not model_tensor_keys or not optimizer_tensor_keys:
@@ -1784,7 +1776,7 @@ def _layerwise_record_from_layer_buf(
             ):
                 optimizer_tensor_keys.append(key)
     model_tensors, optimizer_tensors = _split_recovered_tensors(
-        tensors, model_tensor_keys, optimizer_tensor_keys, optimizer_layer_map,
+        tensors, model_tensor_keys, optimizer_tensor_keys, optimizer_layer_map
     )
     return _ConcordLayerReadyRecord(
         layer_name=layer_name,
@@ -1819,8 +1811,15 @@ def _make_pending_layerwise_records(
     records: List[_ConcordLayerReadyRecord] = []
     for encode_iter in range(n_encode_iters):
         job = _make_layer_recovery_job(
-            encode_iter, rank, is_failed, main_payload, all_layer_order,
-            all_layer_metadata, all_concord_dirs, checkpoint_dir, saved_block_size,
+            encode_iter,
+            rank,
+            is_failed,
+            main_payload,
+            all_layer_order,
+            all_layer_metadata,
+            all_concord_dirs,
+            checkpoint_dir,
+            saved_block_size,
             recovery_rank=recovery_rank,
             failed_group_ranks=[rank] if is_failed else [],
             group_members=[rank],
@@ -1829,20 +1828,20 @@ def _make_pending_layerwise_records(
             continue
         layer_meta = all_layer_metadata.get(rank, {}).get(job.layer_name, {})
         tensor_keys = [
-            getattr(info, "key", "")
-            for info in job.layer_infos
-            if getattr(info, "key", "")
+            getattr(info, "key", "") for info in job.layer_infos if getattr(info, "key", "")
         ]
         model_tensor_keys = list(layer_meta.get("model_tensor_keys", []))
         optimizer_tensor_keys = list(layer_meta.get("optimizer_tensor_keys", []))
         if not model_tensor_keys:
             model_tensor_keys = [
-                key for key in tensor_keys
+                key
+                for key in tensor_keys
                 if _classify_concord_tensor(key).kind in ("model_layer", "model_common")
             ]
         if not optimizer_tensor_keys:
             optimizer_tensor_keys = [
-                key for key in tensor_keys
+                key
+                for key in tensor_keys
                 if _classify_concord_tensor(key).kind in ("optimizer_layer", "optimizer_common")
             ]
         records.append(
@@ -1868,9 +1867,7 @@ def _make_pending_layerwise_records(
 
 
 def _extract_layer_tensors_from_buf(
-    layer_buf: torch.Tensor,
-    layer_infos: List,
-    clone_storage: bool = True,
+    layer_buf: torch.Tensor, layer_infos: List, clone_storage: bool = True
 ) -> Dict[str, torch.Tensor]:
     tensors: Dict[str, torch.Tensor] = {}
     buf = layer_buf.detach().contiguous().reshape(-1).view(torch.uint8)
@@ -1887,7 +1884,7 @@ def _extract_layer_tensors_from_buf(
         n_elem = 1
         for dim in shape:
             n_elem *= int(dim)
-        raw = buf[offset:offset + size]
+        raw = buf[offset : offset + size]
         if clone_storage:
             raw = raw.clone()
         view = raw.view(dtype).reshape(shape)
@@ -1898,8 +1895,7 @@ def _extract_layer_tensors_from_buf(
 
 
 def install_concord_layerwise_runtime_from_state_dict(
-    state_dict: Dict[str, Any],
-    model=None,
+    state_dict: Dict[str, Any], model=None
 ) -> None:
     """Install Concord layer-ready metadata for forward-time hooks."""
     global _active_layerwise_runtime
@@ -1924,7 +1920,8 @@ def install_concord_layerwise_runtime_from_state_dict(
             logger.debug(
                 "Concord layerwise runtime attached to active recovery worker: "
                 "ready_layers=%d live_tensors=%d optimizer_key_summary=%s",
-                len(runtime._records_by_layer), len(runtime._live_tensors),
+                len(runtime._records_by_layer),
+                len(runtime._live_tensors),
                 _summarize_optimizer_keys(optimizer_keys),
             )
         return
@@ -1963,9 +1960,7 @@ def install_concord_layerwise_runtime_from_state_dict(
         runtime.attach_live_model(model)
     _set_active_concord_layerwise_runtime(runtime)
     optimizer_keys = [
-        key
-        for record in runtime._records_by_layer.values()
-        for key in record.optimizer_tensor_keys
+        key for record in runtime._records_by_layer.values() for key in record.optimizer_tensor_keys
     ]
     if _concord_debug_enabled():
         logger.debug(
@@ -1979,7 +1974,7 @@ def install_concord_layerwise_runtime_from_state_dict(
 
 
 def concord_filter_layerwise_model_placeholders(
-    state_dict: Dict[str, Any],
+    state_dict: Dict[str, Any]
 ) -> Tuple[int, int, Set[str]]:
     """Drop layer-owned model placeholders that will be injected by runtime."""
     runtime = _active_layerwise_runtime
@@ -2023,7 +2018,8 @@ def concord_filter_layerwise_model_placeholders(
         logger.debug(
             "Concord layerwise model load: skipped %d placeholder tensors "
             "(%.2f MiB); runtime will inject them before layer forward",
-            removed, removed_bytes / (1024 ** 2),
+            removed,
+            removed_bytes / (1024**2),
         )
     return removed, removed_bytes, skip_keys
 
@@ -2041,6 +2037,7 @@ def concord_async_layerwise_active() -> bool:
 
 
 def concord_materialize_all_layers() -> None:
+    """Wait for and materialize every recovered model layer."""
     runtime = _active_layerwise_runtime
     if runtime is None:
         return
@@ -2055,8 +2052,7 @@ def concord_materialize_first_layer_for_timer() -> bool:
     if runtime is None:
         return False
     layer_indices = [
-        idx for idx, record in runtime._records_by_layer.items()
-        if record.model_tensor_keys
+        idx for idx, record in runtime._records_by_layer.items() if record.model_tensor_keys
     ]
     if not layer_indices:
         return False
@@ -2068,9 +2064,7 @@ def concord_materialize_first_layer_for_timer() -> bool:
     event = runtime._model_events_by_layer.setdefault(layer_idx, threading.Event())
     event.wait()
     if not record.model_ready:
-        raise RuntimeError(
-            f"Concord layer {record.layer_name} model is not ready: {record.error}"
-        )
+        raise RuntimeError(f"Concord layer {record.layer_name} model is not ready: {record.error}")
     runtime._inject_layer_tensors(layer_idx)
     runtime.materialized_layers.add(layer_idx)
     waited = time.time() - t0
@@ -2080,10 +2074,13 @@ def concord_materialize_first_layer_for_timer() -> bool:
     if _concord_debug_enabled():
         logger.debug(
             "Concord layerwise timing: first layer=%s idx=%d injected wait=%.4fs",
-            record.layer_name, layer_idx, waited,
+            record.layer_name,
+            layer_idx,
+            waited,
         )
     try:
         from megatron.training.global_vars import mark_recovery_to_forward_timer
+
         mark_recovery_to_forward_timer(f"{record.layer_name}_injected")
     except Exception:
         pass
@@ -2102,9 +2099,7 @@ def concord_restore_optimizer_control_state(optimizer=None) -> bool:
         states = [pending]
     elif isinstance(pending, (list, tuple)):
         states = list(pending)
-    elif isinstance(pending, dict) and all(
-        isinstance(key, int) for key in pending
-    ):
+    elif isinstance(pending, dict) and all(isinstance(key, int) for key in pending):
         states = [pending[key] for key in sorted(pending)]
     else:
         raise RuntimeError(
@@ -2150,13 +2145,15 @@ def concord_restore_optimizer_control_state(optimizer=None) -> bool:
         logger.debug(
             "Concord optimizer control state restored on main thread: "
             "rank=%d device=cuda:%d grad_scalers=%d",
-            rank, current_device, restored,
+            rank,
+            current_device,
+            restored,
         )
     return restored > 0
 
 
 def concord_register_pending_optimizer_state(
-    state_dict: Dict[str, Any], allow_without_runtime: bool = False,
+    state_dict: Dict[str, Any], allow_without_runtime: bool = False
 ) -> bool:
     """Keep optimizer state_dict alive until its first consumption point."""
     global _pending_optimizer_container, _pending_optimizer_state
@@ -2173,12 +2170,13 @@ def concord_register_pending_optimizer_state(
     _pending_optimizer_container = {"optimizer": optim_state}
     _pending_optimizer_state = optim_state
     if _concord_debug_enabled():
-        deferred_layers = 0 if runtime is None else sum(
-            1 for r in runtime._records_by_layer.values() if r.contains_optimizer_state
+        deferred_layers = (
+            0
+            if runtime is None
+            else sum(1 for r in runtime._records_by_layer.values() if r.contains_optimizer_state)
         )
         logger.debug(
-            "Concord optimizer recovery: deferred optimizer load for %d layers "
-            "(runtime=%s)",
+            "Concord optimizer recovery: deferred optimizer load for %d layers " "(runtime=%s)",
             deferred_layers,
             runtime is not None,
         )
@@ -2196,6 +2194,7 @@ def _concord_optimizer_state_dict(optim_state: Dict[str, Any]) -> Optional[Dict[
 
 
 def concord_normalize_optimizer_state_param_keys(optim_state: Dict[str, Any]) -> None:
+    """Normalize optimizer state parameter keys in place."""
     from megatron.core.optimizer.optimizer import normalize_optimizer_state_param_keys
 
     torch_optim = optim_state.get("optimizer")
@@ -2206,16 +2205,13 @@ def concord_normalize_optimizer_state_param_keys(optim_state: Dict[str, Any]) ->
 
 
 def _assign_deferred_optimizer_tensor(
-    root: Dict[str, Any],
-    flat_key: str,
-    tensor: torch.Tensor,
-    clone_recovery_tensor: bool,
+    root: Dict[str, Any], flat_key: str, tensor: torch.Tensor, clone_recovery_tensor: bool
 ) -> bool:
     """Install a recovery tensor, cloning only when optimizer state may remain on CPU."""
     value = tensor.detach().clone() if clone_recovery_tensor else tensor.detach()
     fp32_prefix = "optimizer.fp32_params_flat."
     if flat_key.startswith(fp32_prefix):
-        suffix = flat_key[len(fp32_prefix):]
+        suffix = flat_key[len(fp32_prefix) :]
         if not suffix:
             return False
         flat = root.setdefault("fp32_params_flat", {})
@@ -2260,6 +2256,7 @@ def _concord_optimizer_uses_cpu_offload(optimizer) -> bool:
         optimizers.extend(chained_optimizers)
     try:
         from megatron.training import get_args
+
         args = get_args()
     except Exception:
         args = None
@@ -2283,9 +2280,7 @@ def _concord_optimizer_uses_cpu_offload(optimizer) -> bool:
     return False
 
 
-def _fp32_master_groups_match_param_groups(
-    value: Any, optim_state: Dict[str, Any],
-) -> bool:
+def _fp32_master_groups_match_param_groups(value: Any, optim_state: Dict[str, Any]) -> bool:
     if not isinstance(value, (list, tuple)) or not value:
         return False
     torch_optim = optim_state.get("optimizer", optim_state)
@@ -2302,7 +2297,7 @@ def _fp32_master_groups_match_param_groups(
 
 
 def _pending_optimizer_missing_flat_fp32_keys(
-    optim_state: Dict[str, Any],
+    optim_state: Dict[str, Any]
 ) -> Tuple[List[str], int, int]:
     """Return missing flat FP32 keys and expected/available counts before unflatten."""
     structure = optim_state.get("_fp32_structure")
@@ -2364,9 +2359,7 @@ def _install_current_fp32_params_for_optimizer_load(optimizer, optim_state: Dict
 
 
 def _materialize_pending_optimizer_tensors(
-    runtime: _ConcordLayerwiseRuntime,
-    optim_state: Dict[str, Any],
-    clone_recovery_tensors: bool,
+    runtime: _ConcordLayerwiseRuntime, optim_state: Dict[str, Any], clone_recovery_tensors: bool
 ) -> Tuple[int, int, List[str]]:
     expected = 0
     updated = 0
@@ -2377,10 +2370,7 @@ def _materialize_pending_optimizer_tensors(
         tensor_source = record.optimizer_tensors
         if not tensor_source and record.tensors:
             _, tensor_source = _split_recovered_tensors(
-                record.tensors,
-                record.model_tensor_keys,
-                record.optimizer_tensor_keys,
-                None,
+                record.tensors, record.model_tensor_keys, record.optimizer_tensor_keys, None
             )
         if not tensor_source:
             continue
@@ -2390,9 +2380,7 @@ def _materialize_pending_optimizer_tensors(
             if tensor is None:
                 missing_keys.append(key)
                 continue
-            if _assign_deferred_optimizer_tensor(
-                optim_state, key, tensor, clone_recovery_tensors,
-            ):
+            if _assign_deferred_optimizer_tensor(optim_state, key, tensor, clone_recovery_tensors):
                 updated += 1
             else:
                 missing_keys.append(key)
@@ -2466,11 +2454,11 @@ def _prepare_deferred_optimizer_state(optimizer, runtime, service):
         unflatten_optimizer_fp32_params,
     )
 
-    missing_fp32_keys, expected_fp32, available_fp32 = (
-        _pending_optimizer_missing_flat_fp32_keys(_pending_optimizer_state)
+    missing_fp32_keys, expected_fp32, available_fp32 = _pending_optimizer_missing_flat_fp32_keys(
+        _pending_optimizer_state
     )
     layer_fp32_keys = {
-        key[len("optimizer.fp32_params_flat."):]
+        key[len("optimizer.fp32_params_flat.") :]
         for record in runtime._records_by_layer.values()
         for key in record.optimizer_tensor_keys
         if key.startswith("optimizer.fp32_params_flat.")
@@ -2484,9 +2472,14 @@ def _prepare_deferred_optimizer_state(optimizer, runtime, service):
             "Concord optimizer FP32 materialization incomplete: expected=%d "
             "available=%d missing=%d common_available=%d layer_available=%d/%d "
             "optimizer_layer_updated=%d missing_examples=%s",
-            expected_fp32, available_fp32, len(missing_fp32_keys),
-            common_fp32_available, layer_fp32_available, len(layer_fp32_keys),
-            updated, missing_fp32_keys[:8],
+            expected_fp32,
+            available_fp32,
+            len(missing_fp32_keys),
+            common_fp32_available,
+            layer_fp32_available,
+            len(layer_fp32_keys),
+            updated,
+            missing_fp32_keys[:8],
         )
     fp32_unflatten_error = None
     if not missing_fp32_keys:
@@ -2516,9 +2509,7 @@ def _prepare_deferred_optimizer_state(optimizer, runtime, service):
         _pending_optimizer_state.pop("_fp32_structure", None)
         _pending_optimizer_state.pop("fp32_from_fp16_params", None)
         _pending_optimizer_state.pop("fp32_from_fp16", None)
-        _install_current_fp32_params_for_optimizer_load(
-            optimizer, _pending_optimizer_state
-        )
+        _install_current_fp32_params_for_optimizer_load(optimizer, _pending_optimizer_state)
     prepare_s = time.time() - t_prepare
     runtime.optimizer_cpu_prepare_s += prepare_s
     return _pending_optimizer_state, prepare_s, clone_recovery_tensors, updated
@@ -2550,7 +2541,11 @@ def concord_log_optimizer_overlap_not_started() -> None:
         "Concord optimizer overlap was not started after forward/backward: "
         "rank=%d pending_optimizer=%s runtime=%s optimizer_h2d_started=%s "
         "service_state=%s",
-        rank, pending, runtime is not None, _optimizer_h2d_started, service.state,
+        rank,
+        pending,
+        runtime is not None,
+        _optimizer_h2d_started,
+        service.state,
     )
 
 
@@ -2583,9 +2578,7 @@ def concord_prepare_optimizer_h2d(optimizer=None) -> bool:
                 )
 
                 t_prepare = time.time()
-                copy_pairs = prepare_optimizer_state_h2d_into_existing(
-                    optimizer, optimizer_state
-                )
+                copy_pairs = prepare_optimizer_state_h2d_into_existing(optimizer, optimizer_state)
                 with _optimizer_prepare_lock:
                     _optimizer_h2d_prepare_s = time.time() - t_prepare
                     _optimizer_h2d_copy_pairs = copy_pairs
@@ -2594,8 +2587,11 @@ def concord_prepare_optimizer_h2d(optimizer=None) -> bool:
                     "Concord optimizer overlap CPU prepare complete: "
                     "optimizer_cpu_prepare_s=%.6fs optimizer_existing_map_s=%.6fs "
                     "optimizer_h2d_tensors=%d cpu_offload=%s updated_tensors=%d",
-                    cpu_prepare_s, _optimizer_h2d_prepare_s, len(copy_pairs),
-                    cpu_offload, updated,
+                    cpu_prepare_s,
+                    _optimizer_h2d_prepare_s,
+                    len(copy_pairs),
+                    cpu_offload,
+                    updated,
                 )
             except BaseException as exc:
                 _optimizer_prepare_error = exc
@@ -2603,9 +2599,7 @@ def concord_prepare_optimizer_h2d(optimizer=None) -> bool:
                 _optimizer_prepare_done.set()
 
         _optimizer_prepare_thread = threading.Thread(
-            target=_prepare,
-            name="concord-optimizer-cpu-prepare",
-            daemon=False,
+            target=_prepare, name="concord-optimizer-cpu-prepare", daemon=False
         )
         _optimizer_prepare_thread.start()
     return True
@@ -2645,7 +2639,9 @@ def concord_start_optimizer_h2d(optimizer=None) -> bool:
     logger.debug(
         "Concord optimizer overlap started: optimizer_overlap_start_s=%.6f "
         "optimizer_h2d_submit_s=%.6fs optimizer_h2d_tensors=%d",
-        _optimizer_h2d_start_wall_s, _optimizer_h2d_load_submit_s, len(copy_pairs),
+        _optimizer_h2d_start_wall_s,
+        _optimizer_h2d_load_submit_s,
+        len(copy_pairs),
     )
     return True
 
@@ -2667,8 +2663,7 @@ def concord_wait_optimizer_h2d(optimizer=None) -> bool:
     if _optimizer_h2d_start_event is not None and _optimizer_h2d_done_event is not None:
         h2d_load_s = _optimizer_h2d_start_event.elapsed_time(_optimizer_h2d_done_event) / 1000.0
     wall_span_s = (
-        0.0 if _optimizer_h2d_start_wall_s is None
-        else time.time() - _optimizer_h2d_start_wall_s
+        0.0 if _optimizer_h2d_start_wall_s is None else time.time() - _optimizer_h2d_start_wall_s
     )
     overlap_hidden_s = max(0.0, h2d_load_s - tail_wait_s)
     service = _get_active_concord_recovery_service()
@@ -2681,7 +2676,11 @@ def concord_wait_optimizer_h2d(optimizer=None) -> bool:
         "Concord optimizer overlap completed: optimizer_overlap_wall_span_s=%.6fs "
         "optimizer_h2d_load_s=%.6fs optimizer_h2d_submit_s=%.6fs "
         "optimizer_tail_wait_s=%.6fs optimizer_overlap_hidden_s=%.6fs",
-        wall_span_s, h2d_load_s, _optimizer_h2d_load_submit_s, tail_wait_s, overlap_hidden_s,
+        wall_span_s,
+        h2d_load_s,
+        _optimizer_h2d_load_submit_s,
+        tail_wait_s,
+        overlap_hidden_s,
     )
     _optimizer_h2d_copy_pairs = None
     _optimizer_h2d_prepare_s = 0.0
@@ -2703,7 +2702,9 @@ def concord_wait_for_optimizer_state(optimizer=None) -> bool:
         _optimizer_prepare_thread.join()
         _optimizer_prepare_thread = None
         if _optimizer_prepare_error is not None:
-            raise RuntimeError("Concord optimizer CPU preparation failed") from _optimizer_prepare_error
+            raise RuntimeError(
+                "Concord optimizer CPU preparation failed"
+            ) from _optimizer_prepare_error
     if _optimizer_h2d_prepared and not _optimizer_h2d_started:
         concord_start_optimizer_h2d(optimizer)
     if concord_wait_optimizer_h2d(optimizer):
@@ -2726,13 +2727,18 @@ def concord_wait_for_optimizer_state(optimizer=None) -> bool:
     logger.debug(
         "Concord deferred optimizer restore: cpu_offload=%s cpu_prepare_s=%.4fs "
         "h2d_load_s=%.4fs total_s=%.4fs updated_tensors=%d",
-        cpu_offload, prepare_s, load_s, prepare_s + load_s, updated,
+        cpu_offload,
+        prepare_s,
+        load_s,
+        prepare_s + load_s,
+        updated,
     )
     _log_concord_async_runtime_timing_once("after_optimizer_state")
     return True
 
 
 def get_concord_layerwise_runtime_summary() -> Optional[Dict[str, Any]]:
+    """Return layerwise runtime statistics when recovery is active."""
     service = _get_active_concord_recovery_service()
     summary = service.summary()
     return None if not summary.get("has_runtime") else summary
@@ -2769,9 +2775,7 @@ def _log_concord_async_runtime_timing_once(context: str) -> None:
     inject_unpinned_bytes = float(runtime.get("inject_unpinned_bytes", 0.0) or 0.0)
     inject_non_cpu_bytes = float(runtime.get("inject_non_cpu_bytes", 0.0) or 0.0)
     inject_contiguous_tensors = float(runtime.get("inject_contiguous_tensors", 0.0) or 0.0)
-    inject_noncontiguous_tensors = float(
-        runtime.get("inject_noncontiguous_tensors", 0.0) or 0.0
-    )
+    inject_noncontiguous_tensors = float(runtime.get("inject_noncontiguous_tensors", 0.0) or 0.0)
     prefetch_submitted_layers = float(runtime.get("prefetch_submitted_layers", 0.0) or 0.0)
     prefetch_submitted_bytes = float(runtime.get("prefetch_submitted_bytes", 0.0) or 0.0)
     prefetch_submitted_tensors = float(runtime.get("prefetch_submitted_tensors", 0.0) or 0.0)
@@ -2807,9 +2811,8 @@ def _log_concord_async_runtime_timing_once(context: str) -> None:
     }
     try:
         from megatron.training import get_args
-        inprocess_recovery = bool(
-            getattr(get_args(), "ft_inprocess_recovery_benchmark", False)
-        )
+
+        inprocess_recovery = bool(getattr(get_args(), "ft_inprocess_recovery_benchmark", False))
     except Exception:
         inprocess_recovery = False
     # In-process recovery reaches the common forward-backward boundary on every rank.
@@ -2860,7 +2863,6 @@ def _log_concord_async_runtime_timing_once(context: str) -> None:
         )
 
 
-
 def finalize_concord_recovery_timing() -> None:
     """Resolve deferred CUDA milestones and log one completed recovery cycle."""
     if _concord_first_layer_recovery_start_s is None:
@@ -2871,10 +2873,12 @@ def finalize_concord_recovery_timing() -> None:
         runtime.resolve_model_h2d_timing()
     _log_concord_async_runtime_timing_once("after_forward_backward")
 
+
 def concord_recovery_safe_point(point: str) -> None:
     """Apply configured recovery wait and teardown ownership at a training safe point."""
     try:
         from megatron.training import get_args
+
         args = get_args()
     except Exception:
         return
@@ -2886,8 +2890,7 @@ def concord_recovery_safe_point(point: str) -> None:
         return
     mode = getattr(args, "concord_recovery_safe_point", "load")
     async_layerwise = (
-        bool(getattr(args, "concord_async_recovery_forward", False))
-        and service.worker is not None
+        bool(getattr(args, "concord_async_recovery_forward", False)) and service.worker is not None
     )
     if (
         async_layerwise
@@ -2895,8 +2898,11 @@ def concord_recovery_safe_point(point: str) -> None:
         and point in ("after_load_checkpoint", "train_step_start", "forward_step_start")
     ):
         _concord_recovery_profile(
-            service.role, "safe_point_deferred_for_layerwise",
-            point=point, mode=mode, state=service.state,
+            service.role,
+            "safe_point_deferred_for_layerwise",
+            point=point,
+            mode=mode,
+            state=service.state,
         )
         return
     should_wait = (
@@ -2926,6 +2932,7 @@ def concord_recovery_safe_point(point: str) -> None:
 
 
 def concord_log_layerwise_runtime_summary(context: str) -> None:
+    """Log layerwise recovery statistics when debugging is enabled."""
     summary = get_concord_layerwise_runtime_summary()
     if summary is not None and _concord_debug_enabled():
         logger.debug("Concord layerwise runtime summary (%s): %s", context, summary)
@@ -2990,18 +2997,17 @@ def _group_by_layer(
             if not optimizer_model_key_map:
                 logger.warning(
                     "Concord distribute_common: optimizer_model_key_map is empty; "
-                    "optimizer-common tensors will remain in layer_common",
+                    "optimizer-common tensors will remain in layer_common"
                 )
             others_by_layer = {group.layer_idx: group for group in others}
             next_kept_infos = []
             next_kept_data = []
             for info, tensor in zip(kept_infos, kept_data):
                 model_key = (
-                    optimizer_model_key_map.get(info.key)
-                    if optimizer_model_key_map else None
+                    optimizer_model_key_map.get(info.key) if optimizer_model_key_map else None
                 )
                 target = _resolve_optimizer_distribute_target(
-                    model_key, common_model_targets, others_by_layer,
+                    model_key, common_model_targets, others_by_layer
                 )
                 if target is not None:
                     target.tensor_infos.append(info)
@@ -3039,17 +3045,23 @@ def _group_by_layer(
                 "Concord: semantic common distribution moved model_common=%d "
                 "tensors (%d bytes), moved optimizer_common=%d tensors (%d bytes), "
                 "grouped optimizer_layer=%d, kept common=%d tensors (%d bytes)",
-                len(moved_infos), moved_bytes,
-                moved_optimizer_common_tensors, moved_optimizer_common_bytes,
-                mapped_optimizer, len(kept_infos), kept_bytes,
+                len(moved_infos),
+                moved_bytes,
+                moved_optimizer_common_tensors,
+                moved_optimizer_common_bytes,
+                mapped_optimizer,
+                len(kept_infos),
+                kept_bytes,
             )
         elif distribute_common and kept_bytes > 1_000_000:
             logger.warning(
                 "Concord distribute_common: kept layer_common=%.1fMB (%d tensors) "
                 "after moving model_common=%d optimizer_common=%d; "
                 "optimizer_model_key_map entries=%d",
-                kept_bytes / 1e6, len(kept_infos),
-                moved_model_common_tensors, moved_optimizer_common_tensors,
+                kept_bytes / 1e6,
+                len(kept_infos),
+                moved_model_common_tensors,
+                moved_optimizer_common_tensors,
                 len(optimizer_model_key_map or {}),
             )
 
@@ -3067,9 +3079,8 @@ def _group_by_layer(
         for info in group.tensor_infos:
             ownership = _classify_concord_tensor(info.key, optimizer_layer_map)
             ownership_counts[ownership.kind] = ownership_counts.get(ownership.kind, 0) + 1
-            ownership_bytes[ownership.kind] = (
-                ownership_bytes.get(ownership.kind, 0)
-                + int(getattr(info, "size_bytes", 0))
+            ownership_bytes[ownership.kind] = ownership_bytes.get(ownership.kind, 0) + int(
+                getattr(info, "size_bytes", 0)
             )
             if ownership.kind == "optimizer_layer":
                 optimizer_layer_keys.append(info.key)
@@ -3129,10 +3140,7 @@ def _synchronize_layer_groups(layer_groups: List[_LayerGroup]) -> List[_LayerGro
     for layer_idx in union_layer_idxs:
         if layer_idx not in groups_by_layer:
             groups_by_layer[layer_idx] = _LayerGroup(
-                layer_idx=layer_idx,
-                tensor_infos=[],
-                tensor_data=[],
-                total_bytes=0,
+                layer_idx=layer_idx, tensor_infos=[], tensor_data=[], total_bytes=0
             )
             added_empty += 1
 
@@ -3202,15 +3210,10 @@ def _path_from_gathered_entry(entry: Any, context: str) -> Optional[Path]:
         return entry
     if isinstance(entry, str):
         return Path(entry)
-    raise TypeError(
-        f"Concord: expected path string in {context}, got {type(entry).__name__}"
-    )
+    raise TypeError(f"Concord: expected path string in {context}, got {type(entry).__name__}")
 
 
-def _gather_all_concord_dirs(
-    checkpoint_dir: Path,
-    world_size: int,
-) -> List[Optional[Path]]:
+def _gather_all_concord_dirs(checkpoint_dir: Path, world_size: int) -> List[Optional[Path]]:
     """All-gather each rank's checkpoint directory path."""
     my_dir = str(checkpoint_dir)
     if world_size > 1 and torch.distributed.is_initialized():
@@ -3261,7 +3264,9 @@ def _prepare_layer_source_addresses(
         logger.info(
             "[CONCORD-DEBUG] %s source address setup: layer_bytes=%d block_size=%d "
             "source_stripes=%d",
-            layer_name, layer_tensor_size, block_size,
+            layer_name,
+            layer_tensor_size,
+            block_size,
             sum(1 for s in actual_sizes if s > 0),
         )
 
@@ -3278,10 +3283,7 @@ def _prepare_layer_source_addresses(
     )
 
 
-def _source_blk_idx_for_stripe(
-    stripe_plans,
-    stripe_id: int,
-) -> int:
+def _source_blk_idx_for_stripe(stripe_plans, stripe_id: int) -> int:
     """Block index within this rank's SOURCE stripes (matches prep/save order)."""
     if stripe_plans[stripe_id].role != StripeRole.SOURCE:
         return -1
@@ -3292,11 +3294,7 @@ def _source_blk_idx_for_stripe(
     return blk_idx
 
 
-def _source_blk_idx_for_node_stripe(
-    stripe_plans,
-    stripe_id: int,
-    node_id: int,
-) -> int:
+def _source_blk_idx_for_node_stripe(stripe_plans, stripe_id: int, node_id: int) -> int:
     """Block index for node_id within its SOURCE stripes up to stripe_id."""
     if stripe_id >= len(stripe_plans):
         return -1
@@ -3317,8 +3315,7 @@ def _n_filled_blocks_for_layer(total_bytes: int, block_size: int, n_source: int)
 
 
 def _build_layer_exchange_plan(
-    manager,
-    layer_idx: int,
+    manager, layer_idx: int
 ) -> Tuple[Dict[int, List[Tuple[int, int]]], Dict[int, List[Tuple[int, int]]], List[int]]:
     """Return packed send/recv block plans and local encoder stripes."""
     my_node = int(manager.rank_in_group) + 1
@@ -3328,8 +3325,7 @@ def _build_layer_exchange_plan(
     src_block_per_node: Dict[int, int] = {node: 0 for node in range(1, manager.concord_n + 1)}
     for sid, plan in enumerate(manager.stripe_plans):
         block_indices = {
-            src_node: src_block_per_node.get(src_node, 0)
-            for src_node in plan.source_node_ids
+            src_node: src_block_per_node.get(src_node, 0) for src_node in plan.source_node_ids
         }
         if my_node in plan.source_node_ids and plan.encoder_node_id != my_node:
             blk_idx = block_indices[my_node]
@@ -3367,16 +3363,13 @@ def _prepare_layer_exchange_network(
     my_node = int(manager.rank_in_group) + 1
     send_blocks, recv_blocks, encoder_sids = _build_layer_exchange_plan(manager, layer_idx)
     frontier_remote_deps: Dict[int, int] = {}
-    frontier_block_per_node: Dict[int, int] = {
-        node: 0 for node in range(1, manager.concord_n + 1)
-    }
+    frontier_block_per_node: Dict[int, int] = {node: 0 for node in range(1, manager.concord_n + 1)}
     for sid, plan in enumerate(manager.stripe_plans):
         remote_deps = 0
         for src_node in plan.source_node_ids:
             blk_idx = frontier_block_per_node[src_node]
-            if (
-                src_node != plan.encoder_node_id
-                and blk_idx < manager.get_n_filled_for_node(layer_idx, src_node)
+            if src_node != plan.encoder_node_id and blk_idx < manager.get_n_filled_for_node(
+                layer_idx, src_node
             ):
                 remote_deps += 1
             frontier_block_per_node[src_node] = blk_idx + 1
@@ -3431,9 +3424,7 @@ def _prepare_layer_exchange_network(
             raise RuntimeError(f"Concord layer exchange: missing recv buffer for node {src_node}")
         required_bytes = len(blocks) * block_size
         if int(recv_buf.numel()) < required_bytes:
-            raise RuntimeError(
-                f"Concord layer exchange: recv buffer too small for node {src_node}"
-            )
+            raise RuntimeError(f"Concord layer exchange: recv buffer too small for node {src_node}")
         recv_offsets[src_node] = {
             sid: slot * block_size for slot, (sid, _blk_idx) in enumerate(blocks)
         }
@@ -3456,114 +3447,163 @@ def _prepare_layer_exchange_network(
         for src_node, blocks in sorted(recv_blocks.items()):
             recv_buf = layer_bufs.remote_layer_bufs[src_node]
             for seg_idx, start, take in _iter_direct_segments(len(blocks)):
-                segment_blocks = list(blocks[start:start + take])
-                recv_tasks.append({
-                    "peer_node": src_node, "peer_rig": src_node - 1,
-                    "addr": int(recv_buf.data_ptr()) + start * block_size,
-                    "size": take * block_size,
-                    "batch_id": int(prepared["batch_id"]) * 1000003 + src_node * 1009 + my_node + seg_idx * 104729,
-                    "lane_id": (lane_base + seg_idx) % layer_exchange_lanes,
-                    "ready_keys": [(int(sid), 0) for sid, _ in segment_blocks],
-                })
+                segment_blocks = list(blocks[start : start + take])
+                recv_tasks.append(
+                    {
+                        "peer_node": src_node,
+                        "peer_rig": src_node - 1,
+                        "addr": int(recv_buf.data_ptr()) + start * block_size,
+                        "size": take * block_size,
+                        "batch_id": int(prepared["batch_id"]) * 1000003
+                        + src_node * 1009
+                        + my_node
+                        + seg_idx * 104729,
+                        "lane_id": (lane_base + seg_idx) % layer_exchange_lanes,
+                        "ready_keys": [(int(sid), 0) for sid, _ in segment_blocks],
+                    }
+                )
         for dst_node, blocks in sorted(send_blocks.items()):
             for seg_idx, start, take in _iter_direct_segments(len(blocks)):
-                task_blocks = blocks[start:start + take]
-                send_tasks.append({
-                    "peer_node": dst_node, "peer_rig": dst_node - 1,
-                    "source_base": int(layer_gpu.data_ptr() if use_gdr else layer_mirror_cpu.data_ptr()),
-                    "send_from_gpu": bool(use_gdr),
-                    "block_indices": [int(blk_idx) for _sid, blk_idx in task_blocks],
-                    "block_size": block_size, "size": take * block_size,
-                    "batch_id": int(prepared["batch_id"]) * 1000003 + my_node * 1009 + dst_node + seg_idx * 104729,
-                    "lane_id": (lane_base + seg_idx) % layer_exchange_lanes,
-                })
+                task_blocks = blocks[start : start + take]
+                send_tasks.append(
+                    {
+                        "peer_node": dst_node,
+                        "peer_rig": dst_node - 1,
+                        "source_base": int(
+                            layer_gpu.data_ptr() if use_gdr else layer_mirror_cpu.data_ptr()
+                        ),
+                        "send_from_gpu": bool(use_gdr),
+                        "block_indices": [int(blk_idx) for _sid, blk_idx in task_blocks],
+                        "block_size": block_size,
+                        "size": take * block_size,
+                        "batch_id": int(prepared["batch_id"]) * 1000003
+                        + my_node * 1009
+                        + dst_node
+                        + seg_idx * 104729,
+                        "lane_id": (lane_base + seg_idx) % layer_exchange_lanes,
+                    }
+                )
     else:
         for src_node, blocks in sorted(recv_blocks.items()):
             recv_buf = layer_bufs.remote_layer_bufs[src_node]
             for sid, _blk_idx in blocks:
                 block_offset = recv_offsets[src_node][sid]
                 for chunk_idx, chunk_offset, chunk_length in chunks:
-                    recv_tasks.append({
-                        "peer_node": src_node, "peer_rig": src_node - 1,
-                        "addr": int(recv_buf.data_ptr()) + block_offset + chunk_offset,
-                        "size": chunk_length, "batch_id": _task_id(sid, chunk_idx),
-                        "lane_id": (lane_base + sid + chunk_idx) % layer_exchange_lanes,
-                        "sid": int(sid), "chunk_idx": int(chunk_idx),
-                        "layer_batch_id": int(prepared["batch_id"]),
-                        "critical_remote_deps": int(frontier_remote_deps[sid]),
-                        "ready_keys": [(int(sid), int(chunk_idx))],
-                    })
+                    recv_tasks.append(
+                        {
+                            "peer_node": src_node,
+                            "peer_rig": src_node - 1,
+                            "addr": int(recv_buf.data_ptr()) + block_offset + chunk_offset,
+                            "size": chunk_length,
+                            "batch_id": _task_id(sid, chunk_idx),
+                            "lane_id": (lane_base + sid + chunk_idx) % layer_exchange_lanes,
+                            "sid": int(sid),
+                            "chunk_idx": int(chunk_idx),
+                            "layer_batch_id": int(prepared["batch_id"]),
+                            "critical_remote_deps": int(frontier_remote_deps[sid]),
+                            "ready_keys": [(int(sid), int(chunk_idx))],
+                        }
+                    )
         source_base = int(layer_gpu.data_ptr() if use_gdr else layer_mirror_cpu.data_ptr())
         for dst_node, blocks in sorted(send_blocks.items()):
             for sid, blk_idx in blocks:
                 for chunk_idx, chunk_offset, chunk_length in chunks:
-                    send_tasks.append({
-                        "peer_node": dst_node, "peer_rig": dst_node - 1,
-                        "addr": source_base + blk_idx * block_size + chunk_offset,
-                        "send_from_gpu": bool(use_gdr),
-                        "ready_chunk": (int(blk_idx), int(chunk_idx)),
-                        "size": chunk_length, "batch_id": _task_id(sid, chunk_idx),
-                        "lane_id": (lane_base + sid + chunk_idx) % layer_exchange_lanes,
-                        "sid": int(sid), "chunk_idx": int(chunk_idx),
-                        "layer_batch_id": int(prepared["batch_id"]),
-                        "critical_remote_deps": int(frontier_remote_deps[sid]),
-                    })
+                    send_tasks.append(
+                        {
+                            "peer_node": dst_node,
+                            "peer_rig": dst_node - 1,
+                            "addr": source_base + blk_idx * block_size + chunk_offset,
+                            "send_from_gpu": bool(use_gdr),
+                            "ready_chunk": (int(blk_idx), int(chunk_idx)),
+                            "size": chunk_length,
+                            "batch_id": _task_id(sid, chunk_idx),
+                            "lane_id": (lane_base + sid + chunk_idx) % layer_exchange_lanes,
+                            "sid": int(sid),
+                            "chunk_idx": int(chunk_idx),
+                            "layer_batch_id": int(prepared["batch_id"]),
+                            "critical_remote_deps": int(frontier_remote_deps[sid]),
+                        }
+                    )
 
     task_ids = [
-        (task["peer_node"], task["lane_id"], task["batch_id"])
-        for task in send_tasks + recv_tasks
+        (task["peer_node"], task["lane_id"], task["batch_id"]) for task in send_tasks + recv_tasks
     ]
     if len(task_ids) != len(set(task_ids)):
         raise RuntimeError("Concord layer exchange generated duplicate task ids")
-    recv_ranges = sorted(
-        (task["addr"], task["addr"] + task["size"]) for task in recv_tasks
-    )
+    recv_ranges = sorted((task["addr"], task["addr"] + task["size"]) for task in recv_tasks)
     if any(left[1] > right[0] for left, right in zip(recv_ranges, recv_ranges[1:])):
         raise RuntimeError("Concord layer exchange generated overlapping receive ranges")
-    for sid in set(ctx_sid for blocks in list(send_blocks.values()) + list(recv_blocks.values()) for ctx_sid, _ in blocks):
+    for sid in set(
+        ctx_sid
+        for blocks in list(send_blocks.values()) + list(recv_blocks.values())
+        for ctx_sid, _ in blocks
+    ):
         covered = [(offset, offset + length) for _idx, offset, length in chunks]
-        if covered[0][0] != 0 or covered[-1][1] != block_size or any(
-            left[1] != right[0] for left, right in zip(covered, covered[1:])
+        if (
+            covered[0][0] != 0
+            or covered[-1][1] != block_size
+            or any(left[1] != right[0] for left, right in zip(covered, covered[1:]))
         ):
-            raise RuntimeError(f"Concord layer exchange chunk coverage is incomplete for stripe {sid}")
+            raise RuntimeError(
+                f"Concord layer exchange chunk coverage is incomplete for stripe {sid}"
+            )
 
     remaining = len(send_tasks) + len(recv_tasks)
     done_event = threading.Event()
     if remaining == 0:
         done_event.set()
     ctx = {
-        "prepared": prepared, "send_blocks": send_blocks, "recv_blocks": recv_blocks,
-        "encoder_sids": encoder_sids, "recv_offsets": recv_offsets,
-        "send_tasks": send_tasks, "recv_tasks": recv_tasks, "remaining": remaining,
-        "remaining_lock": threading.Lock(), "done_event": done_event, "errors": [],
-        "start_time": time.time(), "d2h_start_event": d2h_start_event,
-        "d2h_end_event": d2h_end_event, "d2h_chunk_events": d2h_chunk_events,
+        "prepared": prepared,
+        "send_blocks": send_blocks,
+        "recv_blocks": recv_blocks,
+        "encoder_sids": encoder_sids,
+        "recv_offsets": recv_offsets,
+        "send_tasks": send_tasks,
+        "recv_tasks": recv_tasks,
+        "remaining": remaining,
+        "remaining_lock": threading.Lock(),
+        "done_event": done_event,
+        "errors": [],
+        "start_time": time.time(),
+        "d2h_start_event": d2h_start_event,
+        "d2h_end_event": d2h_end_event,
+        "d2h_chunk_events": d2h_chunk_events,
         "send_source_tensor": layer_gpu if use_gdr else layer_mirror_cpu,
         "remote_source_tensors": list(layer_bufs.remote_layer_bufs.values()),
-        "gdr_enabled": bool(use_gdr), "exchange_chunk_bytes": exchange_chunk_bytes,
-        "chunks": chunks, "chunks_per_block": chunks_per_block,
-        "stage_pack_s": stage_pack_s, "stage_pack_bytes": payload_bytes,
+        "gdr_enabled": bool(use_gdr),
+        "exchange_chunk_bytes": exchange_chunk_bytes,
+        "chunks": chunks,
+        "chunks_per_block": chunks_per_block,
+        "stage_pack_s": stage_pack_s,
+        "stage_pack_bytes": payload_bytes,
         "stage_pack_blocks": int(result.n_filled_blocks),
-        "mirror_ready_lock": threading.Lock(), "mirror_ready_wait_sum_s": 0.0,
+        "mirror_ready_lock": threading.Lock(),
+        "mirror_ready_wait_sum_s": 0.0,
         "mirror_ready_wait_max_s": 0.0,
     }
     encode_specs = _build_layer_exchange_encode_specs(manager, ctx, n)
     ready_queue: queue.Queue = queue.Queue()
-    ready_pending_remote = {
-        key: set(spec["remote_deps"]) for key, spec in encode_specs.items()
-    }
+    ready_pending_remote = {key: set(spec["remote_deps"]) for key, spec in encode_specs.items()}
     ready_queued_keys: Set[Tuple[int, int]] = set()
     for key, pending in ready_pending_remote.items():
         if not pending:
             ready_queue.put(key)
             ready_queued_keys.add(key)
-    ctx.update({
-        "encode_specs": encode_specs, "ready_queue": ready_queue,
-        "ready_lock": threading.Lock(), "ready_pending_remote": ready_pending_remote,
-        "ready_queued_keys": ready_queued_keys, "encoded_keys": set(),
-        "encode_done_event": threading.Event(), "ready_encode_batches": 0,
-        "ready_first_s": 0.0, "ready_last_s": 0.0, "stream_encode_active_s": 0.0,
-    })
+    ctx.update(
+        {
+            "encode_specs": encode_specs,
+            "ready_queue": ready_queue,
+            "ready_lock": threading.Lock(),
+            "ready_pending_remote": ready_pending_remote,
+            "ready_queued_keys": ready_queued_keys,
+            "encoded_keys": set(),
+            "encode_done_event": threading.Event(),
+            "ready_encode_batches": 0,
+            "ready_first_s": 0.0,
+            "ready_last_s": 0.0,
+            "stream_encode_active_s": 0.0,
+        }
+    )
     return ctx
 
 
@@ -3605,23 +3645,21 @@ def _build_layer_exchange_encode_specs(
                     off = recv_offsets.get(src_node, {}).get(sid)
                     if remote_buf is None or off is None:
                         raise RuntimeError(
-                            f"Concord layer exchange: missing packed data for node {src_node} stripe {sid}"
+                            "Concord layer exchange: missing packed data for "
+                            f"node {src_node} stripe {sid}"
                         )
                     data_addrs.append(int(remote_buf.data_ptr()) + off + chunk_offset)
                     remote_deps.add(int(src_node))
             specs[(sid, chunk_idx)] = {
                 "data_addrs": data_addrs,
-                "parity_addrs": [
-                    int(buffer.data_ptr()) + chunk_offset for buffer in parity_bufs
-                ],
-                "remote_deps": remote_deps, "chunk_length": chunk_length,
+                "parity_addrs": [int(buffer.data_ptr()) + chunk_offset for buffer in parity_bufs],
+                "remote_deps": remote_deps,
+                "chunk_length": chunk_length,
             }
     return specs
 
 
-def _encode_layer_exchange_batch(
-    native, jobs: List[Tuple[Dict[str, Any], int, int]]
-) -> None:
+def _encode_layer_exchange_batch(native, jobs: List[Tuple[Dict[str, Any], int, int]]) -> None:
     """Encode ready stripe chunks from multiple layers in one native dispatch."""
     if not jobs:
         return
@@ -3635,9 +3673,7 @@ def _encode_layer_exchange_batch(
         data_addrs.extend(int(addr) for addr in spec["data_addrs"])
         parity_addrs.extend(int(addr) for addr in spec["parity_addrs"])
         chunk_lengths.append(int(spec["chunk_length"]))
-    native.encode_layer_stripes_generic_batch(
-        stripe_ids, data_addrs, parity_addrs, chunk_lengths
-    )
+    native.encode_layer_stripes_generic_batch(stripe_ids, data_addrs, parity_addrs, chunk_lengths)
 
 
 def _parity_shard_suffix(parity_index: int) -> str:
@@ -3666,8 +3702,7 @@ def _write_concord_shard(
     path = stripe_dir / f"concord_shard_rank{rank}{suffix}.pt"
     header_parity_index = 0xFFFFFFFF if parity_index < 0 else int(parity_index)
     header = struct.pack(
-        "<4sIIIQQ", b"CNBK", int(stripe_id), int(role),
-        header_parity_index, ncopy, int(block_size),
+        "<4sIIIQQ", b"CNBK", int(stripe_id), int(role), header_parity_index, ncopy, int(block_size)
     )
     with open(path, "wb") as file:
         file.write(header)
@@ -3699,19 +3734,35 @@ def _save_concord_stripe_files(
                 if block_index < 0 or block_index >= result.n_filled_blocks:
                     continue
                 source = layer_bufs.layer_mirror_cpu[
-                    block_index * block_size:(block_index + 1) * block_size
+                    block_index * block_size : (block_index + 1) * block_size
                 ]
-                jobs.append((
-                    output_dir, result.layer_name, rank, sid,
-                    int(StripeRole.SOURCE), -1, block_size, source,
-                ))
+                jobs.append(
+                    (
+                        output_dir,
+                        result.layer_name,
+                        rank,
+                        sid,
+                        int(StripeRole.SOURCE),
+                        -1,
+                        block_size,
+                        source,
+                    )
+                )
             elif plan.role == StripeRole.ENCODER and include_encoder_parity0:
                 parity0 = layer_bufs.parity_bufs[0][sid]
                 if parity0 is not None:
-                    jobs.append((
-                        output_dir, result.layer_name, rank, sid,
-                        int(StripeRole.ENCODER), 0, block_size, parity0,
-                    ))
+                    jobs.append(
+                        (
+                            output_dir,
+                            result.layer_name,
+                            rank,
+                            sid,
+                            int(StripeRole.ENCODER),
+                            0,
+                            block_size,
+                            parity0,
+                        )
+                    )
     if not jobs:
         return
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as executor:
@@ -3729,9 +3780,7 @@ def wait_for_concord_parity_flush() -> None:
 
 
 def _write_concord_aggregate_parity_files(
-    output_dir: str,
-    rank: int,
-    segments: List[Dict[str, Any]],
+    output_dir: str, rank: int, segments: List[Dict[str, Any]]
 ) -> None:
     """Write received aggregate parity slices using the existing CNBK layout."""
     import concurrent.futures
@@ -3740,14 +3789,17 @@ def _write_concord_aggregate_parity_files(
         stripe_dir = Path(output_dir) / segment["layer_name"] / f"stripe_{segment['sid']}"
         stripe_dir.mkdir(parents=True, exist_ok=True)
         parity_index = int(segment["parity_index"])
-        path = stripe_dir / (
-            f"concord_shard_rank{rank}{_parity_shard_suffix(parity_index)}.pt"
-        )
+        path = stripe_dir / (f"concord_shard_rank{rank}{_parity_shard_suffix(parity_index)}.pt")
         size = int(segment["size"])
         block_size = int(segment["block_size"])
         header = struct.pack(
-            "<4sIIIQQ", b"CNBK", int(segment["sid"]),
-            int(StripeRole.PARITY_TARGET), parity_index, size, block_size,
+            "<4sIIIQQ",
+            b"CNBK",
+            int(segment["sid"]),
+            int(StripeRole.PARITY_TARGET),
+            parity_index,
+            size,
+            block_size,
         )
         data = segment["buffer"][:size]
         with open(path, "wb") as file:
@@ -3809,9 +3861,13 @@ def _finish_aggregate_parity_context(context: Dict[str, Any], debug: bool = Fals
             "CONCORD aggregate parity background rank %d: generation=%d "
             "mode=direct-multi-sge recv_segments=%d recv_bytes=%d "
             "prepare_s=%.3f submit_s=%.3f wait_s=%.3f",
-            context["rank"], context["generation"], context["direct_recv_segments"],
+            context["rank"],
+            context["generation"],
+            context["direct_recv_segments"],
             context["direct_recv_bytes"],
-            timings["prepare_s"], timings["submit_s"], timings["wait_s"],
+            timings["prepare_s"],
+            timings["submit_s"],
+            timings["wait_s"],
         )
 
 
@@ -3846,7 +3902,9 @@ def _wait_previous_async_writers(debug: bool = False, rank: int = -1) -> None:
         if debug:
             logger.info(
                 "CONCORD async writer rank %d: joined previous %s in %.3fs",
-                rank, thread.name, time.time() - start,
+                rank,
+                thread.name,
+                time.time() - start,
             )
     if _async_writer_error is not None:
         error = _async_writer_error
@@ -3855,7 +3913,7 @@ def _wait_previous_async_writers(debug: bool = False, rank: int = -1) -> None:
 
 
 def _wait_async_aggregate_parity_writer(
-    descriptor: Dict[str, Any], debug: bool = False, rank: int = -1,
+    descriptor: Dict[str, Any], debug: bool = False, rank: int = -1
 ) -> Dict[str, Any]:
     """Drain the aggregate-parity writer and return its completed context."""
     global _async_aggregate_parity_writer_thread, _async_writer_error
@@ -3869,7 +3927,9 @@ def _wait_async_aggregate_parity_writer(
         if debug:
             logger.info(
                 "CONCORD async writer rank %d: joined current %s in %.3fs",
-                rank, thread.name, time.time() - start,
+                rank,
+                thread.name,
+                time.time() - start,
             )
     if _async_writer_error is not None:
         error = _async_writer_error
@@ -3914,7 +3974,9 @@ def _build_aggregate_parity_descriptor(
     recv_groups: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
     recv_segments: List[Dict[str, Any]] = []
     tensor_refs: List[torch.Tensor] = []
-    ordered_results = sorted(encode_results, key=lambda result: (result.layer_idx, result.layer_name))
+    ordered_results = sorted(
+        encode_results, key=lambda result: (result.layer_idx, result.layer_name)
+    )
     for result in ordered_results:
         layer_bufs = manager.get_layer_stripe_bufs(result.layer_idx)
         for parity_index in range(1, int(manager.concord_m)):
@@ -3943,33 +4005,33 @@ def _build_aggregate_parity_descriptor(
                     send_groups.setdefault(route_key, []).append(segment)
                 else:
                     recv_groups.setdefault(route_key, []).append(segment)
-                    recv_segments.append({
-                        "buffer": buffer,
-                        "size": block_size,
-                        "block_size": block_size,
-                        "layer_name": result.layer_name,
-                        "layer_idx": result.layer_idx,
-                        "sid": sid,
-                        "parity_index": parity_index,
-                        "peer": peer,
-                        "lane": lane,
-                    })
+                    recv_segments.append(
+                        {
+                            "buffer": buffer,
+                            "size": block_size,
+                            "block_size": block_size,
+                            "layer_name": result.layer_name,
+                            "layer_idx": result.layer_idx,
+                            "sid": sid,
+                            "parity_index": parity_index,
+                            "peer": peer,
+                            "lane": lane,
+                        }
+                    )
 
-    send_tasks = [
-        (peer, lane, segments)
-        for (peer, lane), segments in sorted(send_groups.items())
-    ]
-    recv_tasks = [
-        (peer, lane, segments)
-        for (peer, lane), segments in sorted(recv_groups.items())
-    ]
+    send_tasks = [(peer, lane, segments) for (peer, lane), segments in sorted(send_groups.items())]
+    recv_tasks = [(peer, lane, segments) for (peer, lane), segments in sorted(recv_groups.items())]
     summary = {
         "send_tasks": len(send_tasks),
         "recv_tasks": len(recv_tasks),
         "send_segments": sum(len(task[2]) for task in send_tasks),
         "recv_segments": sum(len(task[2]) for task in recv_tasks),
-        "send_bytes": sum(size for _peer, _lane, segments in send_tasks for _addr, size in segments),
-        "recv_bytes": sum(size for _peer, _lane, segments in recv_tasks for _addr, size in segments),
+        "send_bytes": sum(
+            size for _peer, _lane, segments in send_tasks for _addr, size in segments
+        ),
+        "recv_bytes": sum(
+            size for _peer, _lane, segments in recv_tasks for _addr, size in segments
+        ),
     }
     descriptor = {
         "manager": manager,
@@ -3990,7 +4052,7 @@ def _build_aggregate_parity_descriptor(
 
 
 def _prepare_and_submit_aggregate_parity(
-    descriptor: Dict[str, Any],
+    descriptor: Dict[str, Any]
 ) -> Tuple[Dict[str, Any], Dict[str, int]]:
     """Submit direct aggregate-parity descriptors without new buffer ownership."""
     native = descriptor["native"]
@@ -4001,9 +4063,7 @@ def _prepare_and_submit_aggregate_parity(
     prepare_s = float(descriptor["prepare_s"])
     submit_start = time.time()
     try:
-        counts = native.submit_aggregate_p2(
-            send_tasks, recv_tasks, descriptor["generation"],
-        )
+        counts = native.submit_aggregate_p2(send_tasks, recv_tasks, descriptor["generation"])
     except BaseException:
         descriptor["tensor_refs"] = []
         descriptor["recv_segments"] = []
@@ -4044,6 +4104,7 @@ def save_concord_legacy_checkpoint(
     _dbg = _concord_debug_enabled()
 
     from megatron.training import get_args
+
     args = get_args()
     _dbg = getattr(args, "concord_debug", False)
     _use_async_parity = getattr(args, 'concord_async_parity', False)
@@ -4058,13 +4119,17 @@ def save_concord_legacy_checkpoint(
     # 1. Flatten on a shallow save copy only — mutating live optimizer layout would
     #    duplicate fp32 tensors on iter>=2 and break layer routing below.
     t_decompose = time.time()
-    decomposed, save_copy_s, save_flatten_s, save_decompose_s = decompose_state_dict_for_save(state_dict)
+    decomposed, save_copy_s, save_flatten_s, save_decompose_s = decompose_state_dict_for_save(
+        state_dict
+    )
     save_pre_group_s = time.time() - t_decompose
     total_tensor_size = decomposed.total_tensor_size_bytes
     if _dbg:
         logger.info(
             "Concord save: rank=%d total_tensor_size=%d n_tensors=%d",
-            rank, total_tensor_size, len(decomposed.tensor_data),
+            rank,
+            total_tensor_size,
+            len(decomposed.tensor_data),
         )
 
     if _dbg:
@@ -4122,7 +4187,8 @@ def save_concord_legacy_checkpoint(
     if _dbg:
         logger.info(
             "Concord save: grouped %d layers from %d tensors (layers: %s)",
-            num_layers, n_tensors,
+            num_layers,
+            n_tensors,
             [(g.layer_idx, g.total_bytes) for g in layer_groups],
         )
 
@@ -4141,7 +4207,13 @@ def save_concord_legacy_checkpoint(
         n_parity_my = sum(1 for p in stripe_plans if p.role == StripeRole.PARITY_TARGET)
         logger.info(
             "[CONCORD-DEBUG] rank=%d n=%d stripes=%d roles(src=%d enc=%d par=%d) gdr=%s",
-            rank, n, num_stripes, n_source_my, n_encoder_my, n_parity_my, concord_gdr,
+            rank,
+            n,
+            num_stripes,
+            n_source_my,
+            n_encoder_my,
+            n_parity_my,
+            concord_gdr,
         )
         total_cap = 0
         total_data = 0
@@ -4160,9 +4232,15 @@ def save_concord_legacy_checkpoint(
                 "[CONCORD-DEBUG] %s: data=%.1fMB cap=%.1fMB blk=%.1fMB pad=%.1fMB(%d%%) "
                 "disk_est=%.1fMB (src=%d+P1=%d+P2=%d stripes)",
                 lname,
-                g.total_bytes / 1e6, cap / 1e6, blk / 1e6,
-                pad / 1e6, int(pct),
-                disk_est / 1e6, ns, ne, nt,
+                g.total_bytes / 1e6,
+                cap / 1e6,
+                blk / 1e6,
+                pad / 1e6,
+                int(pct),
+                disk_est / 1e6,
+                ns,
+                ne,
+                nt,
             )
             total_cap += cap
             total_data += g.total_bytes
@@ -4170,8 +4248,11 @@ def save_concord_legacy_checkpoint(
         total_pct = 100.0 * total_pad / total_cap if total_cap > 0 else 0
         logger.info(
             "[CONCORD-DEBUG] rank=%d TOTAL: data=%.1fMB cap=%.1fMB pad=%.1fMB(%.0f%%)",
-            rank, total_data / 1e6, total_cap / 1e6,
-            total_pad / 1e6, total_pct,
+            rank,
+            total_data / 1e6,
+            total_cap / 1e6,
+            total_pad / 1e6,
+            total_pct,
         )
 
     # 5. Per-layer buffers were allocated and registered by the manager when
@@ -4227,8 +4308,7 @@ def save_concord_legacy_checkpoint(
             "(--concord-layer-exchange-encode and required native APIs)"
         )
     use_cross_layer_encode = (
-        has_encode_batch and hasattr(native, "reset_encode_layer")
-        and not use_layer_exchange_encode
+        has_encode_batch and hasattr(native, "reset_encode_layer") and not use_layer_exchange_encode
     )
     effective_max_send_sge = 1
     exchange_chunk_mb = int(os.environ.get("CONCORD_LAYER_EXCHANGE_CHUNK_MB", "32"))
@@ -4238,14 +4318,8 @@ def save_concord_legacy_checkpoint(
     layer_frontier_order = "chunk_layer_sid"
     layer_frontier_order_id = 0
     if exchange_chunk_bytes > 0:
-        layer_frontier_order = os.environ.get(
-            "CONCORD_LAYER_FRONTIER_ORDER", "chunk_layer_sid"
-        )
-        frontier_order_ids = {
-            "chunk_layer_sid": 0,
-            "chunk_sid_layer": 1,
-            "critical_frontier": 2,
-        }
+        layer_frontier_order = os.environ.get("CONCORD_LAYER_FRONTIER_ORDER", "chunk_layer_sid")
+        frontier_order_ids = {"chunk_layer_sid": 0, "chunk_sid_layer": 1, "critical_frontier": 2}
         if layer_frontier_order not in frontier_order_ids:
             raise RuntimeError(
                 "CONCORD_LAYER_FRONTIER_ORDER must be one of "
@@ -4253,12 +4327,16 @@ def save_concord_legacy_checkpoint(
             )
         layer_frontier_order_id = frontier_order_ids[layer_frontier_order]
     if use_layer_exchange_encode:
-        layer_exchange_lanes = int(os.environ.get(
-            "CONCORD_LAYER_EXCHANGE_LANES", str(manager.num_stripes)
-        ))
+        layer_exchange_lanes = int(
+            os.environ.get("CONCORD_LAYER_EXCHANGE_LANES", str(manager.num_stripes))
+        )
         if layer_exchange_lanes <= 0:
             raise RuntimeError("CONCORD_LAYER_EXCHANGE_LANES must be positive")
-        reduce_device = "cuda" if torch.distributed.is_initialized() and torch.distributed.get_backend() == "nccl" else "cpu"
+        reduce_device = (
+            "cuda"
+            if torch.distributed.is_initialized() and torch.distributed.get_backend() == "nccl"
+            else "cpu"
+        )
         chunk_min = torch.tensor(exchange_chunk_mb, dtype=torch.int64, device=reduce_device)
         chunk_max = chunk_min.clone()
         lanes_min = torch.tensor(layer_exchange_lanes, dtype=torch.int64, device=reduce_device)
@@ -4286,10 +4364,16 @@ def save_concord_legacy_checkpoint(
             )
         layer_exchange_lanes = int(lanes_min.item())
         if exchange_chunk_bytes == 0:
-            if not hasattr(native, "send_layer_blocks_to_peer") or not hasattr(native, "get_max_send_sge"):
-                raise RuntimeError("Concord unchunked layer exchange requires native Multi-SGE support")
+            if not hasattr(native, "send_layer_blocks_to_peer") or not hasattr(
+                native, "get_max_send_sge"
+            ):
+                raise RuntimeError(
+                    "Concord unchunked layer exchange requires native Multi-SGE support"
+                )
             local_max_send_sge = max(1, int(native.get_max_send_sge()))
-            max_sge_tensor = torch.tensor(local_max_send_sge, dtype=torch.int32, device=reduce_device)
+            max_sge_tensor = torch.tensor(
+                local_max_send_sge, dtype=torch.int32, device=reduce_device
+            )
             if torch.distributed.is_initialized():
                 torch.distributed.all_reduce(max_sge_tensor, op=torch.distributed.ReduceOp.MIN)
             effective_max_send_sge = int(max_sge_tensor.item())
@@ -4308,7 +4392,10 @@ def save_concord_legacy_checkpoint(
         if trace_save:
             logger.info(
                 "CONCORD save trace rank=%d: pack begin batch=%d %s bytes=%.2fMB block=%.2fMB",
-                rank, encode_batch_id, layer_name, group.total_bytes / 1e6,
+                rank,
+                encode_batch_id,
+                layer_name,
+                group.total_bytes / 1e6,
                 layer_block_size / 1e6,
             )
 
@@ -4344,7 +4431,7 @@ def save_concord_legacy_checkpoint(
                 cursor = 0
                 for info in group.tensor_infos:
                     if info.offset > cursor:
-                        layer_buf_gpu[cursor:info.offset].zero_()
+                        layer_buf_gpu[cursor : info.offset].zero_()
                     cursor = info.offset + info.size_bytes
                 if tail_end > cursor:
                     layer_buf_gpu[cursor:tail_end].zero_()
@@ -4360,9 +4447,17 @@ def save_concord_legacy_checkpoint(
 
         source_address_setup_t0 = time.time()
         state = _prepare_layer_source_addresses(
-            manager, layer_buf_gpu, layer_bufs.layer_mirror_cpu,
-            group.total_bytes, n, num_stripes, layer_block_size, my_node,
-            layer_name, layer_idx, _dbg,
+            manager,
+            layer_buf_gpu,
+            layer_bufs.layer_mirror_cpu,
+            group.total_bytes,
+            n,
+            num_stripes,
+            layer_block_size,
+            my_node,
+            layer_name,
+            layer_idx,
+            _dbg,
         )
         layer_source_address_setup_s = time.time() - source_address_setup_t0
         source_address_setup_total_s += layer_source_address_setup_s
@@ -4392,26 +4487,32 @@ def save_concord_legacy_checkpoint(
             n_filled_blocks=state.n_filled_blocks,
         )
         encode_results.append(result)
-        prepared_layers.append({
-            "batch_id": int(encode_batch_id),
-            "group": group,
-            "result": result,
-            "state": state,
-            "layer_bufs": layer_bufs,
-            "enc_active_masks": enc_active_masks,
-            "pack_s": layer_pack_s,
-            "source_address_setup_s": layer_source_address_setup_s,
-            # Compatibility timing key consumed by existing profiling tooling.
-            "phase1_s": layer_source_address_setup_s,
-            "noncontig": layer_noncontig,
-            "model_bytes": layer_model_bytes,
-            "optimizer_bytes": layer_optimizer_bytes,
-            "common_bytes": layer_common_bytes,
-        })
+        prepared_layers.append(
+            {
+                "batch_id": int(encode_batch_id),
+                "group": group,
+                "result": result,
+                "state": state,
+                "layer_bufs": layer_bufs,
+                "enc_active_masks": enc_active_masks,
+                "pack_s": layer_pack_s,
+                "source_address_setup_s": layer_source_address_setup_s,
+                # Compatibility timing key consumed by existing profiling tooling.
+                "phase1_s": layer_source_address_setup_s,
+                "noncontig": layer_noncontig,
+                "model_bytes": layer_model_bytes,
+                "optimizer_bytes": layer_optimizer_bytes,
+                "common_bytes": layer_common_bytes,
+            }
+        )
         if trace_save:
             logger.info(
                 "CONCORD save trace rank=%d: pack done batch=%d %s pack=%.4fs phase1=%.4fs",
-                rank, encode_batch_id, layer_name, layer_pack_s, layer_source_address_setup_s,
+                rank,
+                encode_batch_id,
+                layer_name,
+                layer_pack_s,
+                layer_source_address_setup_s,
             )
 
     # Stage B: submit prepared layers to native workers.
@@ -4438,8 +4539,7 @@ def save_concord_legacy_checkpoint(
                 return
             if use_cross_layer_encode:
                 native.submit_source_with_batch(
-                    sid, addr, state.mirror_addrs[sid],
-                    layer_block_size, encode_batch_id,
+                    sid, addr, state.mirror_addrs[sid], layer_block_size, encode_batch_id
                 )
             else:
                 native.submit_source(sid, addr, state.mirror_addrs[sid], layer_block_size)
@@ -4451,14 +4551,22 @@ def save_concord_legacy_checkpoint(
                 return
             if use_cross_layer_encode:
                 native.submit_enc_recv_with_batch(
-                    sid, rb.data_ptr(), primary_parity.data_ptr(), deferred_parity.data_ptr(),
-                    layer_block_size, enc_active_masks.get(sid, []),
+                    sid,
+                    rb.data_ptr(),
+                    primary_parity.data_ptr(),
+                    deferred_parity.data_ptr(),
+                    layer_block_size,
+                    enc_active_masks.get(sid, []),
                     encode_batch_id,
                 )
             else:
                 native.submit_enc_recv(
-                    sid, rb.data_ptr(), primary_parity.data_ptr(), deferred_parity.data_ptr(),
-                    layer_block_size, enc_active_masks.get(sid, []),
+                    sid,
+                    rb.data_ptr(),
+                    primary_parity.data_ptr(),
+                    deferred_parity.data_ptr(),
+                    layer_block_size,
+                    enc_active_masks.get(sid, []),
                 )
         elif plan.role == StripeRole.PARITY_TARGET:
             # Deferred to async phase (after all layers' encoding).
@@ -4470,8 +4578,14 @@ def save_concord_legacy_checkpoint(
         for prepared in prepared_layers:
             layer_exchange_contexts.append(
                 _prepare_layer_exchange_network(
-                    manager, native, prepared, n, pack_stream,
-                    effective_max_send_sge, concord_gdr, exchange_chunk_bytes,
+                    manager,
+                    native,
+                    prepared,
+                    n,
+                    pack_stream,
+                    effective_max_send_sge,
+                    concord_gdr,
+                    exchange_chunk_bytes,
                     layer_exchange_lanes,
                 )
             )
@@ -4522,9 +4636,7 @@ def save_concord_legacy_checkpoint(
                         ctx["ready_first_s"] = now_s
                     ctx["ready_last_s"] = now_s
 
-        def _wait_layer_chunks_ready(
-            ctx: Dict[str, Any], chunks: List[Tuple[int, int]]
-        ) -> None:
+        def _wait_layer_chunks_ready(ctx: Dict[str, Any], chunks: List[Tuple[int, int]]) -> None:
             if not chunks:
                 return
             chunk_events = ctx["d2h_chunk_events"]
@@ -4537,9 +4649,7 @@ def save_concord_legacy_checkpoint(
             wait_s = time.time() - wait_t0
             with ctx["mirror_ready_lock"]:
                 ctx["mirror_ready_wait_sum_s"] += wait_s
-                ctx["mirror_ready_wait_max_s"] = max(
-                    ctx["mirror_ready_wait_max_s"], wait_s
-                )
+                ctx["mirror_ready_wait_max_s"] = max(ctx["mirror_ready_wait_max_s"], wait_s)
 
         def _send_worker(peer_key: Tuple[int, int], q: queue.Queue) -> None:
             while True:
@@ -4552,8 +4662,11 @@ def save_concord_legacy_checkpoint(
                         if not task["send_from_gpu"]:
                             _wait_layer_chunks_ready(ctx, [task["ready_chunk"]])
                         native.send_layer_to_peer(
-                            int(task["peer_rig"]), int(task["addr"]), int(task["size"]),
-                            int(task["batch_id"]), int(task["lane_id"]),
+                            int(task["peer_rig"]),
+                            int(task["addr"]),
+                            int(task["size"]),
+                            int(task["batch_id"]),
+                            int(task["lane_id"]),
                         )
                     else:
                         if not task["send_from_gpu"]:
@@ -4564,9 +4677,12 @@ def save_concord_legacy_checkpoint(
                             ]
                             _wait_layer_chunks_ready(ctx, ready_chunks)
                         native.send_layer_blocks_to_peer(
-                            int(task["peer_rig"]), int(task["source_base"]),
-                            task["block_indices"], int(task["block_size"]),
-                            int(task["batch_id"]), int(task["lane_id"]),
+                            int(task["peer_rig"]),
+                            int(task["source_base"]),
+                            task["block_indices"],
+                            int(task["block_size"]),
+                            int(task["batch_id"]),
+                            int(task["lane_id"]),
                         )
                     _mark_task_done(ctx)
                 except BaseException as exc:
@@ -4580,8 +4696,11 @@ def save_concord_legacy_checkpoint(
             for ctx in layer_exchange_contexts:
                 for task in ctx["recv_tasks"]:
                     native.prepare_layer_recv_from_peer(
-                        int(task["peer_rig"]), int(task["addr"]), int(task["size"]),
-                        int(task["batch_id"]), int(task["lane_id"]),
+                        int(task["peer_rig"]),
+                        int(task["addr"]),
+                        int(task["size"]),
+                        int(task["batch_id"]),
+                        int(task["lane_id"]),
                     )
             if world_size > 1:
                 # Ensure every rank has prepared receives before sends can start.
@@ -4596,17 +4715,20 @@ def save_concord_legacy_checkpoint(
                 try:
                     if use_prepared_layer_recv:
                         received = native.wait_prepared_layer_recv_from_peer(
-                            int(task["peer_rig"]), int(task["batch_id"]),
-                            int(task["lane_id"]),
+                            int(task["peer_rig"]), int(task["batch_id"]), int(task["lane_id"])
                         )
                     else:
                         received = native.recv_layer_from_peer(
-                            int(task["peer_rig"]), int(task["addr"]),
-                            int(task["size"]), int(task["batch_id"]), int(task["lane_id"]),
+                            int(task["peer_rig"]),
+                            int(task["addr"]),
+                            int(task["size"]),
+                            int(task["batch_id"]),
+                            int(task["lane_id"]),
                         )
                     if int(received) != int(task["size"]):
                         raise RuntimeError(
-                            f"Concord layer recv size mismatch: got {received}, expected {task['size']}"
+                            "Concord layer recv size mismatch: "
+                            f"got {received}, expected {task['size']}"
                         )
                     _mark_ready_chunks(ctx, int(task["peer_node"]), task.get("ready_keys", []))
                     _mark_task_done(ctx)
@@ -4626,20 +4748,26 @@ def save_concord_legacy_checkpoint(
         exchange_workers: List[threading.Thread] = []
         lx_exchange_thread_start_t0 = time.time()
         for peer_key, q in sorted(send_queues.items()):
-            th = threading.Thread(target=_send_worker, args=(peer_key, q), name=f"concord-layer-send-peer{peer_key[0]}-lane{peer_key[1]}")
+            th = threading.Thread(
+                target=_send_worker,
+                args=(peer_key, q),
+                name=f"concord-layer-send-peer{peer_key[0]}-lane{peer_key[1]}",
+            )
             th.start()
             exchange_workers.append(th)
         for peer_key, q in sorted(recv_queues.items()):
-            th = threading.Thread(target=_recv_worker, args=(peer_key, q), name=f"concord-layer-recv-peer{peer_key[0]}-lane{peer_key[1]}")
+            th = threading.Thread(
+                target=_recv_worker,
+                args=(peer_key, q),
+                name=f"concord-layer-recv-peer{peer_key[0]}-lane{peer_key[1]}",
+            )
             th.start()
             exchange_workers.append(th)
         lx_exchange_thread_start_s = time.time() - lx_exchange_thread_start_t0
 
         encode_errors: List[BaseException] = []
         stream_encode = os.environ.get("CONCORD_LAYER_STREAM_ENCODE", "1") != "0"
-        global_batch_size = max(
-            1, int(os.environ.get("CONCORD_LAYER_ENCODE_BATCH", "24"))
-        )
+        global_batch_size = max(1, int(os.environ.get("CONCORD_LAYER_ENCODE_BATCH", "24")))
         adaptive_encode = os.environ.get("CONCORD_LAYER_ENCODE_ADAPTIVE", "0") == "1"
         adaptive_batch_multiplier = max(
             1, int(os.environ.get("CONCORD_LAYER_ENCODE_ADAPTIVE_MULTIPLIER", "3"))
@@ -4725,14 +4853,12 @@ def save_concord_legacy_checkpoint(
 
         def _encode_coordinator() -> None:
             coordinator_start_s = time.time()
-            use_submit_worker = (
-                os.environ.get("CONCORD_LAYER_ENCODE_SUBMIT_WORKER", "0") == "1"
-            )
+            use_submit_worker = os.environ.get("CONCORD_LAYER_ENCODE_SUBMIT_WORKER", "0") == "1"
             reserved_keys: Dict[int, Set[Tuple[int, int]]] = {
                 id(ctx): set() for ctx in layer_exchange_contexts
             }
-            submit_queue: "queue.Queue[Optional[Tuple[List[Tuple[Dict[str, Any], int, int]], bool, int, float]]]" = queue.Queue(maxsize=1)
-            completion_queue: "queue.Queue[Tuple[List[Tuple[Dict[str, Any], int, int]], bool, int, float, Optional[BaseException]]]" = queue.Queue()
+            submit_queue = queue.Queue(maxsize=1)
+            completion_queue = queue.Queue()
             submit_thread: Optional[threading.Thread] = None
             inflight = False
             inflight_started_s = 0.0
@@ -4774,12 +4900,8 @@ def save_concord_legacy_checkpoint(
                 coordinator_stats["dispatches"] += 1
                 coordinator_stats["jobs"] += len(batch)
                 coordinator_stats["bytes"] += batch_bytes
-                coordinator_stats["max_jobs"] = max(
-                    coordinator_stats["max_jobs"], len(batch)
-                )
-                coordinator_stats["max_bytes"] = max(
-                    coordinator_stats["max_bytes"], batch_bytes
-                )
+                coordinator_stats["max_jobs"] = max(coordinator_stats["max_jobs"], len(batch))
+                coordinator_stats["max_bytes"] = max(coordinator_stats["max_bytes"], batch_bytes)
                 if network_complete_at_submit:
                     coordinator_stats["tail_drain_dispatches"] += 1
                     coordinator_stats["tail_drain_jobs"] += len(batch)
@@ -4821,7 +4943,9 @@ def save_concord_legacy_checkpoint(
                             inflight = False
                     for ctx in layer_exchange_contexts:
                         if ctx["errors"]:
-                            raise RuntimeError("Concord layer exchange failed") from ctx["errors"][0]
+                            raise RuntimeError("Concord layer exchange failed") from ctx["errors"][
+                                0
+                            ]
                         _finalize_context_if_ready(ctx)
                     network_complete = all(
                         ctx["done_event"].is_set() for ctx in layer_exchange_contexts
@@ -4832,11 +4956,7 @@ def save_concord_legacy_checkpoint(
                                 encoded_keys = ctx["encoded_keys"]
                                 reserved = reserved_keys[id(ctx)]
                                 encoded_jobs = len(encoded_keys)
-                                ready_keys = (
-                                    ctx["ready_queued_keys"]
-                                    - encoded_keys
-                                    - reserved
-                                )
+                                ready_keys = ctx["ready_queued_keys"] - encoded_keys - reserved
                                 ready_jobs = len(ready_keys)
                                 ready_bytes = sum(
                                     int(ctx["encode_specs"][key]["chunk_length"])
@@ -4848,17 +4968,16 @@ def save_concord_legacy_checkpoint(
                             coordinator_stats["network_done_ready_bytes"] += ready_bytes
                             coordinator_stats["network_done_inflight_jobs"] += len(reserved)
                             coordinator_stats["network_done_not_ready_jobs"] += max(
-                                0,
-                                total_jobs
-                                - encoded_jobs
-                                - ready_jobs
-                                - len(reserved),
+                                0, total_jobs - encoded_jobs - ready_jobs - len(reserved)
                             )
                         network_frontier_recorded = True
-                    if all(
-                        _encoding_complete(ctx) and ctx["done_event"].is_set()
-                        for ctx in layer_exchange_contexts
-                    ) and not inflight:
+                    if (
+                        all(
+                            _encoding_complete(ctx) and ctx["done_event"].is_set()
+                            for ctx in layer_exchange_contexts
+                        )
+                        and not inflight
+                    ):
                         break
 
                     pending_job_limit = sum(
@@ -4876,25 +4995,18 @@ def save_concord_legacy_checkpoint(
                             stage_capacity = (
                                 pending_job_limit if network_complete else global_batch_size
                             )
-                            staged_batch, cursor = _collect_fair_batch(
-                                cursor, stage_capacity
-                            )
+                            staged_batch, cursor = _collect_fair_batch(cursor, stage_capacity)
                             if staged_batch:
                                 for ctx, sid, chunk_idx in staged_batch:
-                                    reserved_keys[id(ctx)].add(
-                                        (int(sid), int(chunk_idx))
-                                    )
-                                coordinator_stats["inflight_collected_jobs"] += len(
-                                    staged_batch
-                                )
+                                    reserved_keys[id(ctx)].add((int(sid), int(chunk_idx)))
+                                coordinator_stats["inflight_collected_jobs"] += len(staged_batch)
                             else:
                                 staged_batch = None
                         ready_during_inflight = sum(
                             ctx["ready_queue"].qsize() for ctx in layer_exchange_contexts
                         )
                         coordinator_stats["inflight_ready_jobs_max"] = max(
-                            coordinator_stats["inflight_ready_jobs_max"],
-                            ready_during_inflight,
+                            coordinator_stats["inflight_ready_jobs_max"], ready_during_inflight
                         )
                         coordinator_stats["collect_overlap_s"] += time.time() - collect_t0
                         try:
@@ -4915,8 +5027,7 @@ def save_concord_legacy_checkpoint(
                             ctx["ready_queue"].qsize() for ctx in layer_exchange_contexts
                         )
                         adaptive_limit = min(
-                            pending_job_limit,
-                            global_batch_size * adaptive_batch_multiplier,
+                            pending_job_limit, global_batch_size * adaptive_batch_multiplier
                         )
                         dispatch_capacity = min(
                             adaptive_limit, max(global_batch_size, ready_backlog)
@@ -4930,7 +5041,8 @@ def save_concord_legacy_checkpoint(
                         for ctx in layer_exchange_contexts:
                             if ctx["done_event"].is_set() and not _encoding_complete(ctx):
                                 pending = sorted(
-                                    key for key in ctx["encode_specs"]
+                                    key
+                                    for key in ctx["encode_specs"]
                                     if key not in ctx["encoded_keys"]
                                     and key not in reserved_keys[id(ctx)]
                                 )
@@ -4975,9 +5087,7 @@ def save_concord_legacy_checkpoint(
                     coordinator_stats["dispatch_capacity_sum"] += dispatch_capacity
                     submit_s = time.time()
                     if use_submit_worker:
-                        submit_queue.put(
-                            (batch, network_complete, batch_bytes, submit_s)
-                        )
+                        submit_queue.put((batch, network_complete, batch_bytes, submit_s))
                         inflight = True
                         inflight_started_s = submit_s
                     else:
@@ -4986,9 +5096,7 @@ def save_concord_legacy_checkpoint(
                             _encode_layer_exchange_batch(native, batch)
                         except BaseException as exc:
                             error = exc
-                        _finish_batch(
-                            batch, network_complete, batch_bytes, submit_s, error
-                        )
+                        _finish_batch(batch, network_complete, batch_bytes, submit_s, error)
                 for ctx in layer_exchange_contexts:
                     missing = set(ctx["encode_specs"]) - ctx["encoded_keys"]
                     if missing or reserved_keys[id(ctx)]:
@@ -5018,8 +5126,7 @@ def save_concord_legacy_checkpoint(
 
         lx_encode_thread_start_t0 = time.time()
         encode_thread = threading.Thread(
-            target=_encode_coordinator,
-            name="concord-layer-encode-coordinator",
+            target=_encode_coordinator, name="concord-layer-encode-coordinator"
         )
         encode_thread.start()
         lx_encode_thread_start_s = time.time() - lx_encode_thread_start_t0
@@ -5032,8 +5139,12 @@ def save_concord_legacy_checkpoint(
                 for task in ctx["send_tasks"]:
                     send_queues[(int(task["peer_node"]), int(task["lane_id"]))].put((ctx, task))
         else:
-            send_queue_items: Dict[Tuple[int, int], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
-            recv_queue_items: Dict[Tuple[int, int], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+            send_queue_items: Dict[Tuple[int, int], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = (
+                {}
+            )
+            recv_queue_items: Dict[Tuple[int, int], List[Tuple[Dict[str, Any], Dict[str, Any]]]] = (
+                {}
+            )
             for ctx in layer_exchange_contexts:
                 for task in ctx["recv_tasks"]:
                     key = (int(task["peer_node"]), int(task["lane_id"]))
@@ -5042,32 +5153,34 @@ def save_concord_legacy_checkpoint(
                     key = (int(task["peer_node"]), int(task["lane_id"]))
                     send_queue_items.setdefault(key, []).append((ctx, task))
 
-            def _chunk_task_order(
-                item: Tuple[Dict[str, Any], Dict[str, Any]]
-            ) -> Tuple[int, ...]:
+            def _chunk_task_order(item: Tuple[Dict[str, Any], Dict[str, Any]]) -> Tuple[int, ...]:
                 ctx, task = item
                 if layer_frontier_order == "chunk_sid_layer":
                     return (
-                        int(task["chunk_idx"]), int(task["sid"]),
-                        int(task["layer_batch_id"]), int(task["batch_id"]),
+                        int(task["chunk_idx"]),
+                        int(task["sid"]),
+                        int(task["layer_batch_id"]),
+                        int(task["batch_id"]),
                     )
                 if layer_frontier_order == "critical_frontier":
-                    spec = ctx["encode_specs"].get(
-                        (int(task["sid"]), int(task["chunk_idx"]))
-                    )
+                    spec = ctx["encode_specs"].get((int(task["sid"]), int(task["chunk_idx"])))
                     remote_deps = (
                         len(spec["remote_deps"])
                         if spec is not None
                         else int(task["critical_remote_deps"])
                     )
                     return (
-                        remote_deps, int(task["chunk_idx"]),
-                        int(task["layer_batch_id"]), int(task["sid"]),
+                        remote_deps,
+                        int(task["chunk_idx"]),
+                        int(task["layer_batch_id"]),
+                        int(task["sid"]),
                         int(task["batch_id"]),
                     )
                 return (
-                    int(task["chunk_idx"]), int(task["layer_batch_id"]),
-                    int(task["sid"]), int(task["batch_id"]),
+                    int(task["chunk_idx"]),
+                    int(task["layer_batch_id"]),
+                    int(task["sid"]),
+                    int(task["batch_id"]),
                 )
 
             for key, items in send_queue_items.items():
@@ -5103,31 +5216,44 @@ def save_concord_legacy_checkpoint(
             int(task["size"]) for ctx in layer_exchange_contexts for task in ctx["recv_tasks"]
         )
         gdr_send_tasks = sum(
-            1 for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            1
+            for ctx in layer_exchange_contexts
+            for task in ctx["send_tasks"]
             if task["send_from_gpu"]
         )
         gdr_send_bytes = sum(
             int(task["size"])
-            for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            for ctx in layer_exchange_contexts
+            for task in ctx["send_tasks"]
             if task["send_from_gpu"]
         )
-        lx_stage_pack_s = sum(float(ctx.get("stage_pack_s", 0.0)) for ctx in layer_exchange_contexts)
-        lx_stage_pack_bytes = sum(int(ctx.get("stage_pack_bytes", 0)) for ctx in layer_exchange_contexts)
-        lx_stage_pack_blocks = sum(int(ctx.get("stage_pack_blocks", 0)) for ctx in layer_exchange_contexts)
+        lx_stage_pack_s = sum(
+            float(ctx.get("stage_pack_s", 0.0)) for ctx in layer_exchange_contexts
+        )
+        lx_stage_pack_bytes = sum(
+            int(ctx.get("stage_pack_bytes", 0)) for ctx in layer_exchange_contexts
+        )
+        lx_stage_pack_blocks = sum(
+            int(ctx.get("stage_pack_blocks", 0)) for ctx in layer_exchange_contexts
+        )
         lx_cpu_gather_s = 0.0
         lx_cpu_gather_bytes = 0
         lx_direct_sge_tasks = sum(
-            1 for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            1
+            for ctx in layer_exchange_contexts
+            for task in ctx["send_tasks"]
             if "block_indices" in task
         )
         lx_direct_sge_count = sum(
             len(task["block_indices"])
-            for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            for ctx in layer_exchange_contexts
+            for task in ctx["send_tasks"]
             if "block_indices" in task
         )
         lx_direct_sge_bytes = sum(
             int(task["size"])
-            for ctx in layer_exchange_contexts for task in ctx["send_tasks"]
+            for ctx in layer_exchange_contexts
+            for task in ctx["send_tasks"]
             if "block_indices" in task
         )
         lx_mirror_ready_wait_sum_s = sum(
@@ -5143,15 +5269,17 @@ def save_concord_legacy_checkpoint(
             float(ctx["d2h_start_event"].elapsed_time(ctx["d2h_end_event"])) / 1000.0
             for ctx in layer_exchange_contexts
         )
-        lx_exchange_wait_sum_s = sum(float(ctx.get("exchange_wait_s", 0.0)) for ctx in layer_exchange_contexts)
-        lx_exchange_wait_max_s = max(
-            (float(ctx.get("exchange_wait_s", 0.0)) for ctx in layer_exchange_contexts),
-            default=0.0,
+        lx_exchange_wait_sum_s = sum(
+            float(ctx.get("exchange_wait_s", 0.0)) for ctx in layer_exchange_contexts
         )
-        lx_encode_wall_sum_s = sum(float(ctx.get("encode_wall_s", 0.0)) for ctx in layer_exchange_contexts)
+        lx_exchange_wait_max_s = max(
+            (float(ctx.get("exchange_wait_s", 0.0)) for ctx in layer_exchange_contexts), default=0.0
+        )
+        lx_encode_wall_sum_s = sum(
+            float(ctx.get("encode_wall_s", 0.0)) for ctx in layer_exchange_contexts
+        )
         lx_encode_wall_max_s = max(
-            (float(ctx.get("encode_wall_s", 0.0)) for ctx in layer_exchange_contexts),
-            default=0.0,
+            (float(ctx.get("encode_wall_s", 0.0)) for ctx in layer_exchange_contexts), default=0.0
         )
         lx_ready_encode_batches = sum(
             int(ctx.get("ready_encode_batches", 0)) for ctx in layer_exchange_contexts
@@ -5179,25 +5307,27 @@ def save_concord_legacy_checkpoint(
         lx_tail_drain_bytes = int(coordinator_stats["tail_drain_bytes"])
         lx_encode_batch_avg_bytes = (
             float(lx_encode_batch_bytes) / float(lx_encode_batch_dispatches)
-            if lx_encode_batch_dispatches else 0.0
+            if lx_encode_batch_dispatches
+            else 0.0
         )
         lx_encode_batch_avg_occupancy = (
-            float(lx_encode_batch_jobs)
-            / float(coordinator_stats["dispatch_capacity_sum"])
-            if coordinator_stats["dispatch_capacity_sum"] else 0.0
+            float(lx_encode_batch_jobs) / float(coordinator_stats["dispatch_capacity_sum"])
+            if coordinator_stats["dispatch_capacity_sum"]
+            else 0.0
         )
         lx_ready_first_s = min(
-            (float(ctx.get("ready_first_s", 0.0)) for ctx in layer_exchange_contexts
-             if float(ctx.get("ready_first_s", 0.0)) > 0.0),
+            (
+                float(ctx.get("ready_first_s", 0.0))
+                for ctx in layer_exchange_contexts
+                if float(ctx.get("ready_first_s", 0.0)) > 0.0
+            ),
             default=0.0,
         )
         lx_ready_last_s = max(
-            (float(ctx.get("ready_last_s", 0.0)) for ctx in layer_exchange_contexts),
-            default=0.0,
+            (float(ctx.get("ready_last_s", 0.0)) for ctx in layer_exchange_contexts), default=0.0
         )
         lx_layer_elapsed_max = max(
-            (float(ctx.get("layer_elapsed", 0.0)) for ctx in layer_exchange_contexts),
-            default=0.0,
+            (float(ctx.get("layer_elapsed", 0.0)) for ctx in layer_exchange_contexts), default=0.0
         )
         slow_layers = sorted(
             (
@@ -5215,7 +5345,8 @@ def save_concord_legacy_checkpoint(
             reverse=True,
         )[:3]
         lx_slow_layers = ";".join(
-            f"{name}:total={total:.3f},wait={wait:.3f},encode={enc:.3f},stage={stage:.3f},send={send_n},recv={recv_n}"
+            f"{name}:total={total:.3f},wait={wait:.3f},encode={enc:.3f},"
+            f"stage={stage:.3f},send={send_n},recv={recv_n}"
             for total, name, wait, enc, stage, send_n, recv_n in slow_layers
         )
 
@@ -5228,16 +5359,28 @@ def save_concord_legacy_checkpoint(
             submit_total_s = max(submit_total_s, layer_elapsed)
             if _dbg or trace_save:
                 group = prepared["group"]
-                send_bytes = sum(len(v) for v in ctx["send_blocks"].values()) * int(result.block_size)
-                recv_bytes = sum(len(v) for v in ctx["recv_blocks"].values()) * int(result.block_size)
+                send_bytes = sum(len(v) for v in ctx["send_blocks"].values()) * int(
+                    result.block_size
+                )
+                recv_bytes = sum(len(v) for v in ctx["recv_blocks"].values()) * int(
+                    result.block_size
+                )
                 logger.info(
                     "CONCORD save layer-exchange profile rank=%d %s: bytes=%.2fMB pack=%.4fs "
                     "phase1=%.4fs exchange_encode=%.4fs send=%.2fMB recv=%.2fMB noncontig=%d "
                     "model_layer=%.2fMB optimizer_layer=%.2fMB common=%.2fMB",
-                    rank, result.layer_name, group.total_bytes / 1e6, prepared["pack_s"],
-                    prepared["phase1_s"], layer_elapsed, send_bytes / 1e6, recv_bytes / 1e6,
-                    prepared["noncontig"], prepared["model_bytes"] / 1e6,
-                    prepared["optimizer_bytes"] / 1e6, prepared["common_bytes"] / 1e6,
+                    rank,
+                    result.layer_name,
+                    group.total_bytes / 1e6,
+                    prepared["pack_s"],
+                    prepared["phase1_s"],
+                    layer_elapsed,
+                    send_bytes / 1e6,
+                    recv_bytes / 1e6,
+                    prepared["noncontig"],
+                    prepared["model_bytes"] / 1e6,
+                    prepared["optimizer_bytes"] / 1e6,
+                    prepared["common_bytes"] / 1e6,
                 )
     elif use_cross_layer_encode:
         stripe_wave_size = max(1, int(n))
@@ -5246,7 +5389,11 @@ def save_concord_legacy_checkpoint(
             if trace_save:
                 logger.info(
                     "CONCORD save trace rank=%d: submit stripe_wave=%d stripes=[%d,%d) layers=%d",
-                    rank, stripe_wave_id, stripe_start, stripe_end, len(prepared_layers),
+                    rank,
+                    stripe_wave_id,
+                    stripe_start,
+                    stripe_end,
+                    len(prepared_layers),
                 )
             for prepared in prepared_layers:
                 batch_id = int(prepared["batch_id"])
@@ -5269,7 +5416,9 @@ def save_concord_legacy_checkpoint(
             layer_wait_s = 0.0
             wait_t0 = time.time()
             if _dbg:
-                logger.info("CONCORD layer %s: wait_encode_only (deferred parity)", result.layer_name)
+                logger.info(
+                    "CONCORD layer %s: wait_encode_only (deferred parity)", result.layer_name
+                )
             native.wait_encode_only()
             layer_wait_s = time.time() - wait_t0
             wait_total_s += layer_wait_s
@@ -5280,9 +5429,16 @@ def save_concord_legacy_checkpoint(
                     "CONCORD save layer profile rank=%d %s: bytes=%.2fMB pack=%.4fs "
                     "phase1=%.4fs submit=%.4fs wait=%.4fs noncontig=%d "
                     "model_layer=%.2fMB optimizer_layer=%.2fMB common=%.2fMB",
-                    rank, result.layer_name, group.total_bytes / 1e6, prepared["pack_s"],
-                    prepared["phase1_s"], layer_submit_s, layer_wait_s, prepared["noncontig"],
-                    prepared["model_bytes"] / 1e6, prepared["optimizer_bytes"] / 1e6,
+                    rank,
+                    result.layer_name,
+                    group.total_bytes / 1e6,
+                    prepared["pack_s"],
+                    prepared["phase1_s"],
+                    layer_submit_s,
+                    layer_wait_s,
+                    prepared["noncontig"],
+                    prepared["model_bytes"] / 1e6,
+                    prepared["optimizer_bytes"] / 1e6,
                     prepared["common_bytes"] / 1e6,
                 )
 
@@ -5297,10 +5453,17 @@ def save_concord_legacy_checkpoint(
                     "CONCORD save layer profile rank=%d %s: bytes=%.2fMB pack=%.4fs "
                     "phase1=%.4fs submit=%.4fs wait=%.4fs noncontig=%d "
                     "model_layer=%.2fMB optimizer_layer=%.2fMB common=%.2fMB",
-                    rank, result.layer_name, group.total_bytes / 1e6, prepared["pack_s"],
-                    prepared["phase1_s"], layer_submit_times.get(batch_id, 0.0), 0.0,
-                    prepared["noncontig"], prepared["model_bytes"] / 1e6,
-                    prepared["optimizer_bytes"] / 1e6, prepared["common_bytes"] / 1e6,
+                    rank,
+                    result.layer_name,
+                    group.total_bytes / 1e6,
+                    prepared["pack_s"],
+                    prepared["phase1_s"],
+                    layer_submit_times.get(batch_id, 0.0),
+                    0.0,
+                    prepared["noncontig"],
+                    prepared["model_bytes"] / 1e6,
+                    prepared["optimizer_bytes"] / 1e6,
+                    prepared["common_bytes"] / 1e6,
                 )
 
     if use_cross_layer_encode:
@@ -5377,7 +5540,7 @@ def save_concord_legacy_checkpoint(
     # Disk checkpoints retain the completed context through the unified shard write.
     aggregate_parity_dispatch_t0 = time.time()
     aggregate_parity_descriptor, aggregate_parity_summary = _build_aggregate_parity_descriptor(
-        manager, native, encode_results, str(checkpoint_dir), rank, write_to_disk,
+        manager, native, encode_results, str(checkpoint_dir), rank, write_to_disk
     )
     aggregate_parity_context = None
     aggregate_parity_dispatch_s = 0.0
@@ -5386,7 +5549,9 @@ def save_concord_legacy_checkpoint(
     aggregate_parity_submit_s = 0.0
     aggregate_parity_wait_s = 0.0
     if not _use_async_parity:
-        aggregate_parity_context, aggregate_parity_summary = _prepare_and_submit_aggregate_parity(aggregate_parity_descriptor)
+        aggregate_parity_context, aggregate_parity_summary = _prepare_and_submit_aggregate_parity(
+            aggregate_parity_descriptor
+        )
         aggregate_parity_sync_foreground_s = time.time() - aggregate_parity_dispatch_t0
         aggregate_parity_prepare_s = float(aggregate_parity_context["timings"]["prepare_s"])
         aggregate_parity_submit_s = float(aggregate_parity_context["timings"]["submit_s"])
@@ -5436,10 +5601,15 @@ def save_concord_legacy_checkpoint(
             "CONCORD aggregate parity: mode=direct-multi-sge generation=%d "
             "send_tasks=%d recv_tasks=%d send_segments=%d recv_segments=%d "
             "send_bytes=%d recv_bytes=%d async=%s p2_dispatch_s=%.6f",
-            aggregate_parity_descriptor["generation"], aggregate_parity_summary["send_tasks"],
-            aggregate_parity_summary["recv_tasks"], aggregate_parity_summary["send_segments"],
-            aggregate_parity_summary["recv_segments"], aggregate_parity_summary["send_bytes"],
-            aggregate_parity_summary["recv_bytes"], _use_async_parity, aggregate_parity_dispatch_s,
+            aggregate_parity_descriptor["generation"],
+            aggregate_parity_summary["send_tasks"],
+            aggregate_parity_summary["recv_tasks"],
+            aggregate_parity_summary["send_segments"],
+            aggregate_parity_summary["recv_segments"],
+            aggregate_parity_summary["send_bytes"],
+            aggregate_parity_summary["recv_bytes"],
+            _use_async_parity,
+            aggregate_parity_dispatch_s,
         )
 
     summary_fields = {
@@ -5520,54 +5690,52 @@ def save_concord_legacy_checkpoint(
         "lx_layer_elapsed_max": lx_layer_elapsed_max,
     }
     if has_native_timing:
-        summary_fields.update({
-            "d2h_s": float(native_timing.get("d2h_s", 0.0)) + lx_d2h_s,
-            "net_s": native_timing.get("net_s", 0.0),
-            "encode_s": native_timing.get("encode_s", 0.0),
-            "encode_wait_s": native_timing.get("encode_wait_s", 0.0),
-            "encode_batch_dispatches": native_timing.get("encode_batch_dispatches", 0.0),
-            "encode_batch_jobs": native_timing.get("encode_batch_jobs", 0.0),
-            "encode_ec_calls": native_timing.get("encode_ec_calls", 0.0),
-            "encode_pool_plan_s": native_timing.get("encode_pool_plan_s", 0.0),
-            "encode_pool_barrier_s": native_timing.get("encode_pool_barrier_s", 0.0),
-            "encode_worker_compute_max_sum_s": native_timing.get(
-                "encode_worker_compute_max_sum_s", 0.0
-            ),
-            "source_send_sum_s": native_timing.get("source_send_sum_s", 0.0),
-            "source_send_max_s": native_timing.get("source_send_max_s", 0.0),
-            "tagged_ack_wait_sum_s": native_timing.get("tagged_ack_wait_sum_s", 0.0),
-            "tagged_ack_wait_max_s": native_timing.get("tagged_ack_wait_max_s", 0.0),
-            "tagged_ack_wait_count": native_timing.get("tagged_ack_wait_count", 0.0),
-            "enc_recv_sum_s": native_timing.get("enc_recv_sum_s", 0.0),
-            "enc_recv_max_s": native_timing.get("enc_recv_max_s", 0.0),
-            "source_send_tasks": native_timing.get("source_send_tasks", 0.0),
-            "enc_recv_tasks": native_timing.get("enc_recv_tasks", 0.0),
-            "source_send_bytes": native_timing.get("source_send_bytes", 0.0),
-            "source_send_wr_count": native_timing.get("source_send_wr_count", 0.0),
-            "source_send_sge_count": native_timing.get("source_send_sge_count", 0.0),
-            "source_send_max_sge": native_timing.get("source_send_max_sge", 0.0),
-            "enc_recv_bytes": native_timing.get("enc_recv_bytes", 0.0),
-            "mirror_tasks_submitted": native_timing.get("mirror_tasks_submitted", 0.0),
-            "mirror_bytes_submitted": native_timing.get("mirror_bytes_submitted", 0.0),
-            "mirror_tasks_completed": native_timing.get("mirror_tasks_completed", 0.0),
-            "mirror_bytes_completed": native_timing.get("mirror_bytes_completed", 0.0),
-            "mirror_tasks_failed": native_timing.get("mirror_tasks_failed", 0.0),
-            "mirror_bytes_failed": native_timing.get("mirror_bytes_failed", 0.0),
-        })
+        summary_fields.update(
+            {
+                "d2h_s": float(native_timing.get("d2h_s", 0.0)) + lx_d2h_s,
+                "net_s": native_timing.get("net_s", 0.0),
+                "encode_s": native_timing.get("encode_s", 0.0),
+                "encode_wait_s": native_timing.get("encode_wait_s", 0.0),
+                "encode_batch_dispatches": native_timing.get("encode_batch_dispatches", 0.0),
+                "encode_batch_jobs": native_timing.get("encode_batch_jobs", 0.0),
+                "encode_ec_calls": native_timing.get("encode_ec_calls", 0.0),
+                "encode_pool_plan_s": native_timing.get("encode_pool_plan_s", 0.0),
+                "encode_pool_barrier_s": native_timing.get("encode_pool_barrier_s", 0.0),
+                "encode_worker_compute_max_sum_s": native_timing.get(
+                    "encode_worker_compute_max_sum_s", 0.0
+                ),
+                "source_send_sum_s": native_timing.get("source_send_sum_s", 0.0),
+                "source_send_max_s": native_timing.get("source_send_max_s", 0.0),
+                "tagged_ack_wait_sum_s": native_timing.get("tagged_ack_wait_sum_s", 0.0),
+                "tagged_ack_wait_max_s": native_timing.get("tagged_ack_wait_max_s", 0.0),
+                "tagged_ack_wait_count": native_timing.get("tagged_ack_wait_count", 0.0),
+                "enc_recv_sum_s": native_timing.get("enc_recv_sum_s", 0.0),
+                "enc_recv_max_s": native_timing.get("enc_recv_max_s", 0.0),
+                "source_send_tasks": native_timing.get("source_send_tasks", 0.0),
+                "enc_recv_tasks": native_timing.get("enc_recv_tasks", 0.0),
+                "source_send_bytes": native_timing.get("source_send_bytes", 0.0),
+                "source_send_wr_count": native_timing.get("source_send_wr_count", 0.0),
+                "source_send_sge_count": native_timing.get("source_send_sge_count", 0.0),
+                "source_send_max_sge": native_timing.get("source_send_max_sge", 0.0),
+                "enc_recv_bytes": native_timing.get("enc_recv_bytes", 0.0),
+                "mirror_tasks_submitted": native_timing.get("mirror_tasks_submitted", 0.0),
+                "mirror_bytes_submitted": native_timing.get("mirror_bytes_submitted", 0.0),
+                "mirror_tasks_completed": native_timing.get("mirror_tasks_completed", 0.0),
+                "mirror_bytes_completed": native_timing.get("mirror_bytes_completed", 0.0),
+                "mirror_tasks_failed": native_timing.get("mirror_tasks_failed", 0.0),
+                "mirror_bytes_failed": native_timing.get("mirror_bytes_failed", 0.0),
+            }
+        )
     summary = _timing_max_dict(summary_fields)
     if rank == 0:
         mirror_kinds = {
             manager.get_layer_stripe_bufs(result.layer_idx).mirror_buffer_kind
             for result in encode_results
         }
-        canonical_mirror_kind = (
-            next(iter(mirror_kinds)) if len(mirror_kinds) == 1 else "mixed"
-        )
+        canonical_mirror_kind = next(iter(mirror_kinds)) if len(mirror_kinds) == 1 else "mixed"
         prefer_torch_pinned = int(
             any(
-                manager.get_layer_stripe_bufs(
-                    result.layer_idx
-                ).mirror_prefer_torch_pinned
+                manager.get_layer_stripe_bufs(result.layer_idx).mirror_prefer_torch_pinned
                 for result in encode_results
             )
         )
@@ -5590,7 +5758,8 @@ def save_concord_legacy_checkpoint(
                 "pool_plan_s=%(encode_pool_plan_s).4fs "
                 "pool_barrier_s=%(encode_pool_barrier_s).4fs "
                 "worker_compute_max_sum_s=%(encode_worker_compute_max_sum_s).4fs "
-                "source_send_sum_s=%(source_send_sum_s).2fs source_send_max_s=%(source_send_max_s).2fs "
+                "source_send_sum_s=%(source_send_sum_s).2fs "
+                "source_send_max_s=%(source_send_max_s).2fs "
                 "enc_recv_sum_s=%(enc_recv_sum_s).2fs enc_recv_max_s=%(enc_recv_max_s).2fs",
                 summary,
             )
@@ -5601,7 +5770,8 @@ def save_concord_legacy_checkpoint(
                 "aggregate_parity_dispatch_s=%(aggregate_parity_dispatch_s).6fs "
                 "aggregate_parity_prepare_s=%(aggregate_parity_prepare_s).3fs "
                 "aggregate_parity_submit_s=%(aggregate_parity_submit_s).3fs "
-                "aggregate_parity_wait_s=%(aggregate_parity_wait_s).3fs parity_direct=%(aggregate_parity_direct).0f "
+                "aggregate_parity_wait_s=%(aggregate_parity_wait_s).3fs "
+                "parity_direct=%(aggregate_parity_direct).0f "
                 "p2_send_segments=%(aggregate_parity_send_segments).0f "
                 "p2_recv_segments=%(aggregate_parity_recv_segments).0f "
                 "p2_send_bytes=%(aggregate_parity_send_bytes).0f "
@@ -5615,7 +5785,8 @@ def save_concord_legacy_checkpoint(
                 "lx_stage_pack_bytes=%(lx_stage_pack_bytes).0f "
                 "lx_cpu_gather_s=%(lx_cpu_gather_s).4fs "
                 "lx_cpu_gather_bytes=%(lx_cpu_gather_bytes).0f "
-                "direct_sge_tasks=%(lx_direct_sge_tasks).0f direct_sge_count=%(lx_direct_sge_count).0f "
+                "direct_sge_tasks=%(lx_direct_sge_tasks).0f "
+                "direct_sge_count=%(lx_direct_sge_count).0f "
                 "direct_sge_bytes=%(lx_direct_sge_bytes).0f "
                 "mirror_ready_wait_sum_s=%(lx_mirror_ready_wait_sum_s).4fs "
                 "mirror_ready_wait_max_s=%(lx_mirror_ready_wait_max_s).4fs "
@@ -5645,14 +5816,17 @@ def save_concord_legacy_checkpoint(
                 "tail_drain_bytes=%(lx_tail_drain_bytes).0f "
                 "mirror_tasks=%(mirror_tasks_completed).0f/%(mirror_tasks_submitted).0f "
                 "mirror_bytes=%(mirror_bytes_completed).0f/%(mirror_bytes_submitted).0f "
-                "mirror_failed_tasks=%(mirror_tasks_failed).0f mirror_failed_bytes=%(mirror_bytes_failed).0f",
+                "mirror_failed_tasks=%(mirror_tasks_failed).0f "
+                "mirror_failed_bytes=%(mirror_bytes_failed).0f",
                 summary,
             )
             if _dbg or trace_save:
                 logger.info(
-                    "CONCORD save native tasks (%(mode)s): source_send_tasks=%(source_send_tasks).0f "
+                    "CONCORD save native tasks (%(mode)s): "
+                    "source_send_tasks=%(source_send_tasks).0f "
                     "enc_recv_tasks=%(enc_recv_tasks).0f source_send_bytes=%(source_send_bytes).0f "
-                    "enc_recv_bytes=%(enc_recv_bytes).0f source_send_wr_count=%(source_send_wr_count).0f "
+                    "enc_recv_bytes=%(enc_recv_bytes).0f "
+                    "source_send_wr_count=%(source_send_wr_count).0f "
                     "source_send_sge_count=%(source_send_sge_count).0f "
                     "source_send_max_sge=%(source_send_max_sge).0f "
                     "tagged_ack_wait_sum_s=%(tagged_ack_wait_sum_s).4fs "
@@ -5665,7 +5839,8 @@ def save_concord_legacy_checkpoint(
                     "exchange_thread_start_s=%(lx_exchange_thread_start_s).4fs "
                     "encode_thread_start_s=%(lx_encode_thread_start_s).4fs "
                     "queue_put_s=%(lx_queue_put_s).4fs exchange_join_s=%(lx_exchange_join_s).4fs "
-                    "encode_join_s=%(lx_encode_join_s).4fs ready_batches=%(lx_ready_encode_batches).0f "
+                    "encode_join_s=%(lx_encode_join_s).4fs "
+                    "ready_batches=%(lx_ready_encode_batches).0f "
                     "ready_first_s=%(lx_ready_first_s).4fs ready_last_s=%(lx_ready_last_s).4fs "
                     "layer_elapsed_max_s=%(lx_layer_elapsed_max).4fs",
                     summary,
@@ -5673,7 +5848,8 @@ def save_concord_legacy_checkpoint(
                 logger.info(
                     "CONCORD save stage detail (%(mode)s): stage_pack_s=%(lx_stage_pack_s).4fs "
                     "stage_sync_s=%(lx_stage_sync_s).4fs "
-                    "stage_pack_bytes=%(lx_stage_pack_bytes).0f stage_pack_blocks=%(lx_stage_pack_blocks).0f "
+                    "stage_pack_bytes=%(lx_stage_pack_bytes).0f "
+                    "stage_pack_blocks=%(lx_stage_pack_blocks).0f "
                     "canonical_d2h_s=%(lx_d2h_s).4fs cpu_gather_s=%(lx_cpu_gather_s).4fs "
                     "cpu_gather_bytes=%(lx_cpu_gather_bytes).0f "
                     "exchange_wait_sum_s=%(lx_exchange_wait_sum_s).4fs "
@@ -5682,10 +5858,7 @@ def save_concord_legacy_checkpoint(
                     "encode_wall_max_s=%(lx_encode_wall_max_s).4fs",
                     summary,
                 )
-                logger.info(
-                    "CONCORD save slow layers (%s): %s",
-                    summary["mode"], lx_slow_layers,
-                )
+                logger.info("CONCORD save slow layers (%s): %s", summary["mode"], lx_slow_layers)
         else:
             logger.info(
                 "CONCORD save timing (%(mode)s): e2e_s=%(e2e_s).2fs "
@@ -5696,7 +5869,7 @@ def save_concord_legacy_checkpoint(
 
     if _use_async_parity and write_to_disk:
         aggregate_parity_context = _wait_async_aggregate_parity_writer(
-            aggregate_parity_descriptor, debug=_dbg, rank=rank,
+            aggregate_parity_descriptor, debug=_dbg, rank=rank
         )
     if write_to_disk:
         import concurrent.futures
@@ -5706,12 +5879,19 @@ def save_concord_legacy_checkpoint(
                 shard_futures = [
                     executor.submit(
                         _save_concord_stripe_files,
-                        manager, str(checkpoint_dir), rank, num_stripes, encode_results,
-                        True, True,
+                        manager,
+                        str(checkpoint_dir),
+                        rank,
+                        num_stripes,
+                        encode_results,
+                        True,
+                        True,
                     ),
                     executor.submit(
                         _write_concord_aggregate_parity_files,
-                        str(checkpoint_dir), rank, aggregate_parity_context["recv_segments"],
+                        str(checkpoint_dir),
+                        rank,
+                        aggregate_parity_context["recv_segments"],
                     ),
                 ]
                 for future in shard_futures:
@@ -5735,7 +5915,10 @@ def save_concord_legacy_checkpoint(
             ownership = _classify_concord_tensor(key, optimizer_layer_map)
             if result.layer_idx >= 0 and ownership.kind in ("model_layer", "model_common"):
                 model_tensor_keys.append(key)
-            elif result.layer_idx >= 0 and ownership.kind in ("optimizer_layer", "optimizer_common"):
+            elif result.layer_idx >= 0 and ownership.kind in (
+                "optimizer_layer",
+                "optimizer_common",
+            ):
                 optimizer_tensor_keys.append(key)
         local_layer_order.append(result.layer_name)
         layer_distributed_common_keys = sorted(
@@ -5777,7 +5960,8 @@ def save_concord_legacy_checkpoint(
 
     # 6. Write metadata-only main file (data_len=0; tensor payload lives in layer CNBK shards).
     main_file = checkpoint_dir / f"concord_main_rank{rank}.pt"
-    from megatron.training.legacy_io_utils import write_main_prepared, MAGIC_CONCORD
+    from megatron.training.legacy_io_utils import MAGIC_CONCORD, write_main_prepared
+
     # restore global offsets (per-layer encode clobbered them with local offsets)
     for info in decomposed.tensor_infos:
         info.offset = _global_offsets[id(info)]
@@ -5787,18 +5971,16 @@ def save_concord_legacy_checkpoint(
     global _cached_all_layer_metadata, _cached_all_actual_tensor_sizes
     global _cached_all_optimizer_layer_maps
     if _cached_all_tensor_infos is None:
-        (
-            all_tensor_infos,
-            all_layer_order,
-            all_layer_metadata,
-            all_optimizer_layer_maps,
-        ) = _exchange_concord_group_metadata(
-            decomposed.tensor_infos, local_layer_order, local_layer_metadata,
-            optimizer_layer_map,
+        (all_tensor_infos, all_layer_order, all_layer_metadata, all_optimizer_layer_maps) = (
+            _exchange_concord_group_metadata(
+                decomposed.tensor_infos,
+                local_layer_order,
+                local_layer_metadata,
+                optimizer_layer_map,
+            )
         )
         all_actual_tensor_sizes = {
-            r: tensor_layout_size(infos)
-            for r, infos in all_tensor_infos.items()
+            r: tensor_layout_size(infos) for r, infos in all_tensor_infos.items()
         }
         _cached_all_tensor_infos = all_tensor_infos
         _cached_all_layer_order = all_layer_order
@@ -5808,7 +5990,8 @@ def save_concord_legacy_checkpoint(
         if _dbg:
             logger.info(
                 "Concord save: group metadata exchange %.3fs (ranks=%d)",
-                time.time() - t_meta, len(all_tensor_infos),
+                time.time() - t_meta,
+                len(all_tensor_infos),
             )
     else:
         all_tensor_infos = _cached_all_tensor_infos
@@ -5818,43 +6001,55 @@ def save_concord_legacy_checkpoint(
         all_optimizer_layer_maps = _cached_all_optimizer_layer_maps
         if _dbg:
             logger.info(
-                "Concord save: group metadata exchange (cached) %.3fs",
-                time.time() - t_meta,
+                "Concord save: group metadata exchange (cached) %.3fs", time.time() - t_meta
             )
 
     meta1 = pickle.dumps(decomposed.non_tensor_data)
     meta2 = pickle.dumps(decomposed.tensor_infos)
-    extra = pickle.dumps({
-        "version": 3, "format": "concord_torch_legacy", "rank": rank,
-        "group_id": manager.group_id, "rank_in_group": rg,
-        "poa_path": manager.get_resolved_table_path() or native.path(),
-        "n": n, "k": int(manager.concord_k), "m": int(manager.concord_m),
-        "active_width": int(manager.concord_active_width),
-        "num_stripes": num_stripes, "num_layers": num_layers,
-        "block_size": block_size, "gdr": concord_gdr,
-        "actual_tensor_size": total_tensor_size,
-        "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
-        "state_dict_keys": list(state_dict.keys()),
-        "group_member_ranks": manager.group_member_ranks,
-        "node_slot_to_global_rank": manager.node_slot_to_global_rank,
-        "layer_names": local_layer_order,
-        "all_tensor_infos": all_tensor_infos,
-        "all_layer_order": all_layer_order,
-        "all_layer_metadata": all_layer_metadata,
-        "all_actual_tensor_sizes": all_actual_tensor_sizes,
-        "all_optimizer_layer_maps": all_optimizer_layer_maps,
-        "optimizer_layer_map": optimizer_layer_map,
-        "distributed_common_keys": sorted(distributed_common_keys),
-    })
+    extra = pickle.dumps(
+        {
+            "version": 3,
+            "format": "concord_torch_legacy",
+            "rank": rank,
+            "group_id": manager.group_id,
+            "rank_in_group": rg,
+            "poa_path": manager.get_resolved_table_path() or native.path(),
+            "n": n,
+            "k": int(manager.concord_k),
+            "m": int(manager.concord_m),
+            "active_width": int(manager.concord_active_width),
+            "num_stripes": num_stripes,
+            "num_layers": num_layers,
+            "block_size": block_size,
+            "gdr": concord_gdr,
+            "actual_tensor_size": total_tensor_size,
+            "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
+            "state_dict_keys": list(state_dict.keys()),
+            "group_member_ranks": manager.group_member_ranks,
+            "node_slot_to_global_rank": manager.node_slot_to_global_rank,
+            "layer_names": local_layer_order,
+            "all_tensor_infos": all_tensor_infos,
+            "all_layer_order": all_layer_order,
+            "all_layer_metadata": all_layer_metadata,
+            "all_actual_tensor_sizes": all_actual_tensor_sizes,
+            "all_optimizer_layer_maps": all_optimizer_layer_maps,
+            "optimizer_layer_map": optimizer_layer_map,
+            "distributed_common_keys": sorted(distributed_common_keys),
+        }
+    )
     if write_to_disk:
-        write_main_prepared(
-            str(main_file), MAGIC_CONCORD, meta1, meta2, extra, memoryview(b""), 0,
-        )
+        write_main_prepared(str(main_file), MAGIC_CONCORD, meta1, meta2, extra, memoryview(b""), 0)
 
     if _dbg:
         logger.info(
-            "Concord save: done rank=%d node=%d gdr=%s layers=%d file=%s (metadata-only, write_to_disk=%s)",
-            rank, my_node, concord_gdr, num_layers, main_file, write_to_disk,
+            "Concord save: done rank=%d node=%d gdr=%s layers=%d file=%s "
+            "(metadata-only, write_to_disk=%s)",
+            rank,
+            my_node,
+            concord_gdr,
+            num_layers,
+            main_file,
+            write_to_disk,
         )
 
     del _global_offsets
@@ -5864,14 +6059,14 @@ def save_concord_legacy_checkpoint(
 
     if _dbg:
         logger.info(
-            "Concord save: native module and save buffers kept alive for reuse (rank=%d)",
-            rank,
+            "Concord save: native module and save buffers kept alive for reuse (rank=%d)", rank
         )
 
 
 # ---------------------------------------------------------------------------
 # Hardware recovery helpers
 # ---------------------------------------------------------------------------
+
 
 def _read_cnbk_header(file, filepath: str) -> Tuple[int, int, int, int, int]:
     """Read and validate the fixed 32-byte CNBK header."""
@@ -5880,9 +6075,7 @@ def _read_cnbk_header(file, filepath: str) -> Tuple[int, int, int, int, int]:
         raise RuntimeError(
             f"Concord load: short CNBK header in {filepath}: got {len(header)} bytes"
         )
-    magic, stripe_id, role, parity_index, data_size, block_size = struct.unpack(
-        "<4sIIIQQ", header
-    )
+    magic, stripe_id, role, parity_index, data_size, block_size = struct.unpack("<4sIIIQQ", header)
     if magic != b"CNBK":
         raise RuntimeError(f"Concord load: invalid CNBK magic in {filepath}")
     if int(data_size) > int(block_size):
@@ -5890,9 +6083,7 @@ def _read_cnbk_header(file, filepath: str) -> Tuple[int, int, int, int, int]:
             "Concord load: CNBK data_size exceeds block_size in "
             f"{filepath}: data_size={data_size} block_size={block_size}"
         )
-    return (
-        int(stripe_id), int(role), int(parity_index), int(data_size), int(block_size)
-    )
+    return (int(stripe_id), int(role), int(parity_index), int(data_size), int(block_size))
 
 
 def _read_cnbk_payload_into(file, dst: torch.Tensor, size: int, filepath: str) -> None:
@@ -5913,9 +6104,7 @@ def _read_frbk_block(filepath: str) -> Optional[torch.Tensor]:
     if not path.is_file():
         return None
     with open(path, "rb") as file:
-        _stripe_id, _role, _parity_index, data_size, _block_size = (
-            _read_cnbk_header(file, filepath)
-        )
+        _stripe_id, _role, _parity_index, data_size, _block_size = _read_cnbk_header(file, filepath)
         data = torch.empty(data_size, dtype=torch.uint8)
         _read_cnbk_payload_into(file, data, data_size, filepath)
     return data
@@ -5927,20 +6116,13 @@ def _read_frbk_block_into(dst: torch.Tensor, filepath: str) -> int:
     if not path.is_file():
         return 0
     with open(path, "rb") as file:
-        _stripe_id, _role, _parity_index, data_size, _block_size = (
-            _read_cnbk_header(file, filepath)
-        )
+        _stripe_id, _role, _parity_index, data_size, _block_size = _read_cnbk_header(file, filepath)
         ncopy = min(data_size, int(dst.numel()))
         _read_cnbk_payload_into(file, dst, ncopy, filepath)
         return ncopy
 
 
-def _read_frbk_range_into(
-    dst: torch.Tensor,
-    filepath: str,
-    payload_offset: int,
-    size: int,
-) -> int:
+def _read_frbk_range_into(dst: torch.Tensor, filepath: str, payload_offset: int, size: int) -> int:
     """Read a byte range from a CNBK payload directly into dst."""
     if size <= 0:
         return 0
@@ -5952,9 +6134,7 @@ def _read_frbk_range_into(
     if not path.is_file():
         return 0
     with open(path, "rb") as file:
-        _stripe_id, _role, _parity_index, data_size, _block_size = (
-            _read_cnbk_header(file, filepath)
-        )
+        _stripe_id, _role, _parity_index, data_size, _block_size = _read_cnbk_header(file, filepath)
         if payload_offset >= data_size:
             return 0
         ncopy = min(int(size), data_size - int(payload_offset), int(dst.numel()))
@@ -5962,6 +6142,7 @@ def _read_frbk_range_into(
             file.seek(int(payload_offset), os.SEEK_CUR)
             _read_cnbk_payload_into(file, dst, ncopy, filepath)
         return ncopy
+
 
 def _stripe_block_path(
     checkpoint_dir: Path,
@@ -5984,15 +6165,11 @@ def _stripe_block_path(
 
 
 def _read_stripe_block(
-    checkpoint_dir: Path,
-    layer_name: str,
-    stripe_id: int,
-    shard_owner_rank: int,
-    stripe_role: int,
+    checkpoint_dir: Path, layer_name: str, stripe_id: int, shard_owner_rank: int, stripe_role: int
 ) -> Optional[torch.Tensor]:
     """Read a stripe shard from a specific checkpoint directory."""
     filepath = _stripe_block_path(
-        checkpoint_dir, layer_name, stripe_id, shard_owner_rank, stripe_role,
+        checkpoint_dir, layer_name, stripe_id, shard_owner_rank, stripe_role
     )
     return _read_frbk_block(str(filepath))
 
@@ -6000,11 +6177,12 @@ def _read_stripe_block(
 def _assert_concord_main_metadata_only(main_path: Path) -> None:
     """Reject legacy main files that embed tensor payload (pre-metadata-only save)."""
     from megatron.training.legacy_io_utils import (
-        MAGIC_CONCORD,
         _HEADER_MAGIC_LEN,
+        MAGIC_CONCORD,
         _read_header,
         is_raw_format,
     )
+
     if is_raw_format(str(main_path), MAGIC_CONCORD):
         with open(main_path, "rb") as f:
             magic = f.read(_HEADER_MAGIC_LEN)
@@ -6032,8 +6210,7 @@ def _concord_coding_layout(metadata: Dict[str, Any], context: str) -> Dict[str, 
         version = int(metadata.get("version", -1))
     except (TypeError, ValueError) as exc:
         raise RuntimeError(
-            f"Concord load: invalid metadata version in {context}: "
-            f"{metadata.get('version')!r}"
+            f"Concord load: invalid metadata version in {context}: " f"{metadata.get('version')!r}"
         ) from exc
     if version != 3:
         raise RuntimeError(
@@ -6041,9 +6218,7 @@ def _concord_coding_layout(metadata: Dict[str, Any], context: str) -> Dict[str, 
             f"got {metadata.get('version')!r}"
         )
     if metadata.get("format") != "concord_torch_legacy":
-        raise RuntimeError(
-            f"Concord load: invalid format in {context}: {metadata.get('format')!r}"
-        )
+        raise RuntimeError(f"Concord load: invalid format in {context}: {metadata.get('format')!r}")
     try:
         layout = {
             "n": int(metadata["n"]),
@@ -6058,20 +6233,14 @@ def _concord_coding_layout(metadata: Dict[str, Any], context: str) -> Dict[str, 
             f"Concord load: coding layout values must be positive in {context}: {layout}"
         )
     if layout["active_width"] != layout["k"] + layout["m"]:
-        raise RuntimeError(
-            f"Concord load: active_width must equal k + m in {context}: {layout}"
-        )
+        raise RuntimeError(f"Concord load: active_width must equal k + m in {context}: {layout}")
     if layout["active_width"] > layout["n"]:
-        raise RuntimeError(
-            f"Concord load: active_width exceeds n in {context}: {layout}"
-        )
+        raise RuntimeError(f"Concord load: active_width exceeds n in {context}: {layout}")
     return layout
 
 
 def _validate_concord_layer_metadata(
-    layer_metadata: Dict[str, Any],
-    main_layout: Dict[str, int],
-    layer_main_path: Path,
+    layer_metadata: Dict[str, Any], main_layout: Dict[str, int], layer_main_path: Path
 ) -> None:
     """Require layer metadata to use the same v3 coding layout as main."""
     layer_layout = _concord_coding_layout(layer_metadata, str(layer_main_path))
@@ -6083,9 +6252,7 @@ def _validate_concord_layer_metadata(
 
 
 def _read_local_concord_main_payload(
-    checkpoint_dir: Path,
-    rank: int,
-    load_tensor_buffer: bool = False,
+    checkpoint_dir: Path, rank: int, load_tensor_buffer: bool = False
 ) -> Dict[str, Any]:
     """Read this rank's main.pt from local disk only (no collective)."""
     main_path = checkpoint_dir / f"concord_main_rank{rank}.pt"
@@ -6098,10 +6265,11 @@ def _read_local_concord_main_payload(
         )
     _assert_concord_main_metadata_only(main_path)
     from megatron.training.legacy_io_utils import (
+        MAGIC_CONCORD,
         is_raw_format,
         read_raw_checkpoint_metadata,
-        MAGIC_CONCORD,
     )
+
     if is_raw_format(str(main_path), MAGIC_CONCORD):
         payload = read_raw_checkpoint_metadata(str(main_path), MAGIC_CONCORD)
     else:
@@ -6112,10 +6280,7 @@ def _read_local_concord_main_payload(
 
 
 def _load_concord_main_payload(
-    checkpoint_dir: Path,
-    rank: int,
-    world_size: int,
-    load_tensor_buffer: bool = False,
+    checkpoint_dir: Path, rank: int, world_size: int, load_tensor_buffer: bool = False
 ) -> Dict[str, Any]:
     """Load main payload; recover failed-rank metadata from group fields in main."""
     main_path = checkpoint_dir / f"concord_main_rank{rank}.pt"
@@ -6124,15 +6289,13 @@ def _load_concord_main_payload(
     if main_path.is_file():
         try:
             local_payload = _read_local_concord_main_payload(
-                checkpoint_dir, rank, load_tensor_buffer=load_tensor_buffer,
+                checkpoint_dir, rank, load_tensor_buffer=load_tensor_buffer
             )
         except Exception as exc:
             local_error = f"{type(exc).__name__}: {exc}"
 
     if local_error is not None:
-        raise RuntimeError(
-            f"Concord legacy: failed reading main file {main_path}: {local_error}"
-        )
+        raise RuntimeError(f"Concord legacy: failed reading main file {main_path}: {local_error}")
 
     if world_size <= 1 or not torch.distributed.is_initialized():
         if local_payload is None:
@@ -6160,7 +6323,8 @@ def _load_concord_main_payload(
                 logger.debug(
                     "Concord legacy: concord_main_rank%d.pt missing locally; "
                     "recovered tensor_infos from rank %d",
-                    rank, src_rank,
+                    rank,
+                    src_rank,
                 )
             resolved["tensor_infos"] = all_ti[rank]
             all_sizes = resolved.get("all_actual_tensor_sizes", {})
@@ -6174,7 +6338,8 @@ def _load_concord_main_payload(
             logger.warning(
                 "Concord legacy: using rank %d tensor_infos as fallback for rank %d "
                 "(old checkpoint without all_tensor_infos)",
-                src_rank, rank,
+                src_rank,
+                rank,
             )
             resolved["tensor_buffer"] = None
             return resolved
@@ -6182,7 +6347,6 @@ def _load_concord_main_payload(
     raise FileNotFoundError(
         f"Concord legacy: concord_main_rank{rank}.pt missing on all ranks under {checkpoint_dir}"
     )
-
 
 
 def _optimizer_layer_map_for_rank(main_payload: Dict[str, Any], rank: int) -> Dict[str, int]:
@@ -6197,8 +6361,7 @@ def _optimizer_layer_map_for_rank(main_payload: Dict[str, Any], rank: int) -> Di
 
 
 def _concord_metadata_from_payload(
-    main_payload: Dict[str, Any],
-    failed_rank: Optional[int],
+    main_payload: Dict[str, Any], failed_rank: Optional[int]
 ) -> Tuple[Dict[int, List[Any]], Dict[int, List[str]], Dict[int, Dict[str, Dict[str, Any]]]]:
     """Return group metadata dicts keyed by global rank (from main extra fields)."""
     all_tensor_infos = main_payload.get("all_tensor_infos") or {}
@@ -6218,15 +6381,13 @@ def _concord_metadata_from_payload(
     if not all_layer_metadata and failed_rank is not None:
         logger.warning(
             "Concord recovery: checkpoint missing all_layer_metadata; "
-            "per-layer metadata may be incomplete",
+            "per-layer metadata may be incomplete"
         )
     return all_tensor_infos, all_layer_order, all_layer_metadata
 
 
 def _read_local_layer_metadata(
-    checkpoint_dir: Path,
-    layer_name: str,
-    rank: int,
+    checkpoint_dir: Path, layer_name: str, rank: int
 ) -> Optional[Dict[str, Any]]:
     """Read per-layer metadata file for this rank, if present."""
     layer_main_path = checkpoint_dir / layer_name / f"concord_layer_main_rank{rank}.pt"
@@ -6257,9 +6418,7 @@ def _max_layer_block_size(
     for layer_name in all_layer_order.get(rank, []):
         max_bs = max(
             max_bs,
-            _resolve_layer_block_size(
-                rank, layer_name, all_layer_metadata, saved_block_size,
-            ),
+            _resolve_layer_block_size(rank, layer_name, all_layer_metadata, saved_block_size),
         )
     return max_bs
 
@@ -6313,28 +6472,39 @@ def _allocate_recovery_buf_pool(
             for _ in range(concurrency)
         ]
 
-    failed_recv_bufs = [
-        allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
-        for _ in range(concurrency)
-    ] if is_failed else []
-    decoder_recovered_bufs = [
-        allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
-        for _ in range(concurrency)
-    ] if is_decoder else []
-    decoder_recovered_buf2s = [
-        allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
-        for _ in range(concurrency)
-    ] if is_decoder and dual_failure else []
+    failed_recv_bufs = (
+        [
+            allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
+            for _ in range(concurrency)
+        ]
+        if is_failed
+        else []
+    )
+    decoder_recovered_bufs = (
+        [
+            allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
+            for _ in range(concurrency)
+        ]
+        if is_decoder
+        else []
+    )
+    decoder_recovered_buf2s = (
+        [
+            allocate_hugepage_tensor(max_block_size, fallback_pin_memory=True)
+            for _ in range(concurrency)
+        ]
+        if is_decoder and dual_failure
+        else []
+    )
 
     decoder_recv_bufs = decoder_recv_buf_slots[0] if decoder_recv_buf_slots else []
     failed_recv_buf = failed_recv_bufs[0] if failed_recv_bufs else None
     decoder_recovered_buf = decoder_recovered_bufs[0] if decoder_recovered_bufs else None
     decoder_recovered_buf2 = decoder_recovered_buf2s[0] if decoder_recovered_buf2s else None
     failed_layer_buf = (
-        allocate_hugepage_tensor(
-            num_source_stripes * max_block_size, fallback_pin_memory=True,
-        )
-        if is_failed else None
+        allocate_hugepage_tensor(num_source_stripes * max_block_size, fallback_pin_memory=True)
+        if is_failed
+        else None
     )
 
     bufs_to_register: List[torch.Tensor] = []
@@ -6365,10 +6535,7 @@ def _allocate_recovery_buf_pool(
 
 
 def _preallocate_stable_failed_layer_bufs(
-    native,
-    buf_pool: Optional[_RecoveryBufPool],
-    jobs: List[_ConcordLayerRecoveryJob],
-    n: int,
+    native, buf_pool: Optional[_RecoveryBufPool], jobs: List[_ConcordLayerRecoveryJob], n: int
 ) -> None:
     """Allocate per-layer failed buffers whose views survive until forward."""
     if buf_pool is None or not jobs:
@@ -6423,8 +6590,8 @@ def _map_layer_buf_to_full_buf(
             and global_offset + size <= full_buf.numel()
             and local_offset + size <= layer_buf.numel()
         ):
-            full_buf[global_offset:global_offset + size].copy_(
-                layer_buf[local_offset:local_offset + size]
+            full_buf[global_offset : global_offset + size].copy_(
+                layer_buf[local_offset : local_offset + size]
             )
             copied += size
     return copied
@@ -6467,12 +6634,9 @@ def _make_layer_recovery_job(
         member_meta = all_layer_metadata.get(member, {}).get(member_layer_name)
         if member_meta is None:
             member_dir = (
-                all_concord_dirs[member]
-                if member < len(all_concord_dirs) else checkpoint_dir
+                all_concord_dirs[member] if member < len(all_concord_dirs) else checkpoint_dir
             )
-            member_meta = _read_local_layer_metadata(
-                member_dir, member_layer_name, member,
-            )
+            member_meta = _read_local_layer_metadata(member_dir, member_layer_name, member)
         if member_meta is None:
             raise RuntimeError(
                 "Concord recovery: missing metadata for synchronized encode iteration "
@@ -6498,8 +6662,7 @@ def _make_layer_recovery_job(
     actual_size = int(meta.get("actual_tensor_size", 0) or 0)
 
     member_to_node = {
-        int(member): node_id
-        for node_id, member in enumerate(participating_ranks, start=1)
+        int(member): node_id for node_id, member in enumerate(participating_ranks, start=1)
     }
     member_actual_sizes = {
         member_to_node[int(member)]: int(meta.get("actual_tensor_size", 0) or 0)
@@ -6513,9 +6676,7 @@ def _make_layer_recovery_job(
                 f"Concord recovery: failed rank {failed_rank} is not in group {participating_ranks}"
             )
         _failed_layer_name, failed_meta = metadata_by_rank[int(failed_rank)]
-        target_actual_sizes[failed_node] = int(
-            failed_meta.get("actual_tensor_size", 0) or 0
-        )
+        target_actual_sizes[failed_node] = int(failed_meta.get("actual_tensor_size", 0) or 0)
 
     layer_idx = -1
     if layer_name.startswith("layer_"):
@@ -6563,21 +6724,24 @@ def _materialize_recovered_layer(
                     "Concord recovery: full_buf is required when map_to_full_buf is enabled"
                 )
             copied = _map_layer_buf_to_full_buf(
-                layer_buf, job.layer_infos, global_tensor_infos, full_buf,
+                layer_buf,
+                job.layer_infos,
+                global_tensor_infos,
+                full_buf,
                 optimizer_layer_map=getattr(manager, "_concord_optimizer_layer_map", None),
                 common_only=(map_to_full_buf == "common_only"),
             )
             map_s = time.time() - t_map
         t_extract = time.time()
-        need_layer_tensors = (
-            tensor_views_by_key is not None or (runtime is not None and job.layer_idx >= 0)
+        need_layer_tensors = tensor_views_by_key is not None or (
+            runtime is not None and job.layer_idx >= 0
         )
         layer_tensors = (
             _extract_layer_tensors_from_buf(
-                layer_buf, job.layer_infos,
-                clone_storage=clone_runtime_tensors,
+                layer_buf, job.layer_infos, clone_storage=clone_runtime_tensors
             )
-            if need_layer_tensors else None
+            if need_layer_tensors
+            else None
         )
         if tensor_views_by_key is not None and layer_tensors:
             tensor_views_by_key.update(layer_tensors)
@@ -6587,14 +6751,23 @@ def _materialize_recovered_layer(
         layer_timing["map_to_full_buf_s"] = map_s
         layer_timing["extract_runtime_tensors_s"] = extract_s
         _concord_recovery_profile(
-            recovery_role, "materialize_done", layer=job.layer_name,
-            layer_idx=job.layer_idx, copied_bytes=copied, map_s=map_s,
-            extract_runtime_tensors_s=extract_s, materialize_s=materialize_s,
+            recovery_role,
+            "materialize_done",
+            layer=job.layer_name,
+            layer_idx=job.layer_idx,
+            copied_bytes=copied,
+            map_s=map_s,
+            extract_runtime_tensors_s=extract_s,
+            materialize_s=materialize_s,
             runtime_tensors=len(layer_tensors or {}),
         )
         record = _layerwise_record_from_layer_buf(
-            job.layer_name, job.encode_iter, job.layer_infos, copied,
-            materialize_s, tensors=layer_tensors,
+            job.layer_name,
+            job.encode_iter,
+            job.layer_infos,
+            copied,
+            materialize_s,
+            tensors=layer_tensors,
             optimizer_layer_map=getattr(manager, "_concord_optimizer_layer_map", None),
             model_tensor_keys=(
                 runtime._records_by_layer[job.layer_idx].model_tensor_keys
@@ -6621,23 +6794,27 @@ def _materialize_recovered_layer(
                 model_tensors=model_tensors,
             )
             if pending_record is not None and pending_record.contains_optimizer_state:
-                runtime.mark_optimizer_ready(
-                    job.layer_idx, optimizer_tensors=optimizer_tensors,
-                )
+                runtime.mark_optimizer_ready(job.layer_idx, optimizer_tensors=optimizer_tensors)
             else:
                 runtime.mark_optimizer_ready(job.layer_idx)
             _concord_recovery_profile(
-                recovery_role, "mark_layer_ready_done", layer=job.layer_name,
-                layer_idx=job.layer_idx, elapsed_s=time.time() - t_mark,
+                recovery_role,
+                "mark_layer_ready_done",
+                layer=job.layer_name,
+                layer_idx=job.layer_idx,
+                elapsed_s=time.time() - t_mark,
                 model_tensors=len(model_tensors or {}),
                 optimizer_tensors=len(optimizer_tensors or {}),
             )
         if _concord_debug_enabled():
             destination = "tensor_views" if map_to_full_buf == "none" else "full_buf"
             logger.debug(
-                "Concord recovery: %s materialized %d bytes into %s "
-                "(expected %d) in %.4fs",
-                job.layer_name, copied, destination, job.actual_size, materialize_s,
+                "Concord recovery: %s materialized %d bytes into %s " "(expected %d) in %.4fs",
+                job.layer_name,
+                copied,
+                destination,
+                job.actual_size,
+                materialize_s,
             )
     return record, layer_timing
 
@@ -6661,32 +6838,55 @@ def _run_layer_recovery_job(
 ) -> Tuple[Optional[_ConcordLayerReadyRecord], Dict[str, float]]:
     t_job = time.time()
     _concord_recovery_profile(
-        recovery_role, "job_start", layer=job.layer_name, layer_idx=job.layer_idx,
-        encode_iter=job.encode_iter, map_to_full_buf=map_to_full_buf,
+        recovery_role,
+        "job_start",
+        layer=job.layer_name,
+        layer_idx=job.layer_idx,
+        encode_iter=job.encode_iter,
+        map_to_full_buf=map_to_full_buf,
         preloaded_blocks=len(preloaded.get(job.encode_iter, {})),
     )
     layer_buf, layer_timing = _recover_one_layer_network(
-        manager, native, job.layer_name,
-        job.layer_idx, job.layer_block_size, job.actual_size,
-        n, rank, preloaded_blocks=preloaded.get(job.encode_iter, {}),
-        buf_pool=buf_pool, recovery_role=recovery_role,
+        manager,
+        native,
+        job.layer_name,
+        job.layer_idx,
+        job.layer_block_size,
+        job.actual_size,
+        n,
+        rank,
+        preloaded_blocks=preloaded.get(job.encode_iter, {}),
+        buf_pool=buf_pool,
+        recovery_role=recovery_role,
     )
 
     record, materialize_timing = _materialize_recovered_layer(
-        job, manager, is_failed, layer_buf, full_buf, global_tensor_infos,
-        runtime=runtime, map_to_full_buf=map_to_full_buf,
+        job,
+        manager,
+        is_failed,
+        layer_buf,
+        full_buf,
+        global_tensor_infos,
+        runtime=runtime,
+        map_to_full_buf=map_to_full_buf,
         clone_runtime_tensors=clone_runtime_tensors,
-        recovery_role=recovery_role, tensor_views_by_key=tensor_views_by_key,
+        recovery_role=recovery_role,
+        tensor_views_by_key=tensor_views_by_key,
     )
     layer_timing.update(materialize_timing)
     layer_timing["job_total_s"] = time.time() - t_job
     _concord_recovery_profile(
-        recovery_role, "job_done", layer=job.layer_name, layer_idx=job.layer_idx,
+        recovery_role,
+        "job_done",
+        layer=job.layer_name,
+        layer_idx=job.layer_idx,
         elapsed_s=layer_timing["job_total_s"],
         network_batch_s=layer_timing.get("network_batch_s", 0.0),
         materialize_s=layer_timing.get("materialize_s", 0.0),
     )
     return record, layer_timing
+
+
 def _recovery_data_failed_pos(plan: Dict[str, Any], n: int) -> Optional[int]:
     """Return the first critical failed SOURCE column."""
     if plan.get('dual_failure'):
@@ -6701,10 +6901,7 @@ def _recovery_data_failed_pos(plan: Dict[str, Any], n: int) -> Optional[int]:
 
 
 def _build_failed_source_block_indices(
-    manager,
-    plans: List[Dict[str, Any]],
-    active_by_stripe: Dict[int, bool],
-    n: int,
+    manager, plans: List[Dict[str, Any]], active_by_stripe: Dict[int, bool], n: int
 ) -> Dict[Tuple[int, int], int]:
     source_indices: Dict[Tuple[int, int], int] = {}
     for plan in plans:
@@ -6717,9 +6914,7 @@ def _build_failed_source_block_indices(
             original_role = int(target.get('original_role', -1))
             if original_role != int(StripeRole.SOURCE):
                 continue
-            blk_idx = _source_blk_idx_for_node_stripe(
-                manager.stripe_plans, sid, failed_node,
-            )
+            blk_idx = _source_blk_idx_for_node_stripe(manager.stripe_plans, sid, failed_node)
             if blk_idx < 0:
                 raise RuntimeError(
                     "Concord recovery: failed SOURCE has no saved block index "
@@ -6730,22 +6925,18 @@ def _build_failed_source_block_indices(
 
 
 def _group_recovery_data_windows_by_column(
-    data_plans: List[Dict[str, Any]],
-    n: int,
+    data_plans: List[Dict[str, Any]], n: int
 ) -> List[List[Dict[str, Any]]]:
     windows: List[List[Dict[str, Any]]] = []
     # Dual-failure critical recovery includes SOURCE columns only.
     for failed_pos in range(max(int(ConcordManager().concord_k), 0)):
         column_plans = [
-            plan for plan in data_plans
-            if _recovery_data_failed_pos(plan, n) == failed_pos
+            plan for plan in data_plans if _recovery_data_failed_pos(plan, n) == failed_pos
         ]
         column_plans.sort(key=lambda plan: int(plan['stripe_id']))
         for start in range(0, len(column_plans), max(n - 1, 1)):
-            windows.append(column_plans[start:start + max(n - 1, 1)])
+            windows.append(column_plans[start : start + max(n - 1, 1)])
     return windows
-
-
 
 
 def _iter_recovery_windows_for_job(
@@ -6759,9 +6950,14 @@ def _iter_recovery_windows_for_job(
     recovery_role: str,
 ) -> Tuple[List[_ConcordRecoveryWindow], Dict[int, torch.Tensor], Dict[str, float]]:
     layer_timing: Dict[str, float] = {
-        'rdma_xfer_s': 0.0, 'decode_s': 0.0, 'network_batch_s': 0.0,
-        'network_submit_s': 0.0, 'network_wait_s': 0.0,
-        'submit_s': 0.0, 'wait_s': 0.0, 'waves': 0,
+        'rdma_xfer_s': 0.0,
+        'decode_s': 0.0,
+        'network_batch_s': 0.0,
+        'network_submit_s': 0.0,
+        'network_wait_s': 0.0,
+        'submit_s': 0.0,
+        'wait_s': 0.0,
+        'waves': 0,
         'pipeline_overlap_s': 0.0,
     }
     if not manager.recovery_stripe_plans:
@@ -6776,38 +6972,48 @@ def _iter_recovery_windows_for_job(
             logger.debug(
                 "Concord recovery layer %s: rank %d has no critical SOURCE stripes "
                 "(skipped parity stripes=%d padding stripes=%d)",
-                job.layer_name, rank, len(parity_plans), skipped_padding_stripes,
+                job.layer_name,
+                rank,
+                len(parity_plans),
+                skipped_padding_stripes,
             )
         return [], {}, layer_timing
 
     my_blocks, layer_buf, decoder_count, helper_count, failed_count = (
         _prepare_recovery_layer_buffers(
-            native, manager, n, job.layer_idx, job.layer_block_size, data_plans,
-            preloaded_blocks, buf_pool,
+            native,
+            manager,
+            n,
+            job.layer_idx,
+            job.layer_block_size,
+            data_plans,
+            preloaded_blocks,
+            buf_pool,
         )
     )
     num_source_stripes = (n - 1) * int(manager.concord_k)
-    my_node = manager.rank_in_group + 1
     source_block_indices = _build_failed_source_block_indices(
-        manager, data_plans, active_by_stripe, n,
+        manager, data_plans, active_by_stripe, n
     )
     column_windows = _group_recovery_data_windows_by_column(data_plans, n)
     windows: List[_ConcordRecoveryWindow] = []
     for wave_plans in column_windows:
-        windows.append(_ConcordRecoveryWindow(
-            job=job,
-            plans=wave_plans,
-            active_by_stripe=active_by_stripe,
-            wave_idx=len(windows),
-            layer_buf=layer_buf,
-            src_block_start=0,
-            slot_start=0,
-            source_block_indices=source_block_indices,
-            decoder_stripes=decoder_count,
-            helper_stripes=helper_count,
-            failed_stripes=failed_count,
-            skipped_padding_stripes=skipped_padding_stripes,
-        ))
+        windows.append(
+            _ConcordRecoveryWindow(
+                job=job,
+                plans=wave_plans,
+                active_by_stripe=active_by_stripe,
+                wave_idx=len(windows),
+                layer_buf=layer_buf,
+                src_block_start=0,
+                slot_start=0,
+                source_block_indices=source_block_indices,
+                decoder_stripes=decoder_count,
+                helper_stripes=helper_count,
+                failed_stripes=failed_count,
+                skipped_padding_stripes=skipped_padding_stripes,
+            )
+        )
 
     max_window_size = max((len(window.plans) for window in windows), default=0)
 
@@ -6816,10 +7022,19 @@ def _iter_recovery_windows_for_job(
             "Concord recovery layer %s: rank %d — critical=%d raw_critical=%d "
             "parity_deferred=%d padding_skipped=%d filled=%d/%d "
             "decoder=%d helper=%d failed=%d stripes windows=%d max_window_size=%d",
-            job.layer_name, rank, len(data_plans), len(raw_data_plans),
-            len(parity_plans), skipped_padding_stripes,
-            n_filled_blocks, num_source_stripes,
-            decoder_count, helper_count, failed_count, len(windows), max_window_size,
+            job.layer_name,
+            rank,
+            len(data_plans),
+            len(raw_data_plans),
+            len(parity_plans),
+            skipped_padding_stripes,
+            n_filled_blocks,
+            num_source_stripes,
+            decoder_count,
+            helper_count,
+            failed_count,
+            len(windows),
+            max_window_size,
         )
     layer_timing['waves'] = len(windows)
     return windows, my_blocks, layer_timing
@@ -6829,12 +7044,12 @@ def _concord_recovery_parity_repair_enabled() -> bool:
     """Return whether the active Concord hardware recovery requires repair."""
     try:
         from megatron.training import get_args
+
         args = get_args()
     except Exception:
         return False
-    return (
-        bool(getattr(args, "use_concord", False))
-        and bool(getattr(args, "use_concord_hardware_failure", False))
+    return bool(getattr(args, "use_concord", False)) and bool(
+        getattr(args, "use_concord_hardware_failure", False)
     )
 
 
@@ -6844,6 +7059,7 @@ def _concord_recovery_async_parity_enabled() -> bool:
         return False
     try:
         from megatron.training import get_args
+
         return bool(getattr(get_args(), "concord_recovery_async_parity", False))
     except Exception:
         return False
@@ -6877,9 +7093,7 @@ def _ensure_recovery_parity_layer_buffers(
                 per_rank[rig] = int(job.member_actual_sizes.get(rig + 1, 0))
         else:
             per_rank[int(manager.rank_in_group)] = int(job.actual_size)
-        manager._allocate_layer_stripe_bufs(
-            native, layer_idx, block_size, source_on_cpu=True
-        )
+        manager._allocate_layer_stripe_bufs(native, layer_idx, block_size, source_on_cpu=True)
 
         my_total_bytes = int(per_rank.get(int(manager.rank_in_group), job.actual_size) or 0)
         tail_bytes = my_total_bytes % block_size if block_size > 0 else 0
@@ -6899,10 +7113,7 @@ def _flush_recovery_async_parity(reason: str, role: str = "unknown") -> None:
 
 
 def _validate_recovery_alignment(
-    jobs: List[_ConcordLayerRecoveryJob],
-    plans: List[Dict[str, Any]],
-    n: int,
-    common_wave_size: int,
+    jobs: List[_ConcordLayerRecoveryJob], plans: List[Dict[str, Any]], n: int, common_wave_size: int
 ) -> None:
     """Validate local protocol inputs without adding distributed synchronization."""
     encode_iters = [int(job.encode_iter) for job in jobs]
@@ -6964,9 +7175,7 @@ def _validate_recovery_alignment(
                     f"expected {expected_stripe_ids}, got {stripe_ids}"
                 )
     if common_wave_size <= 0:
-        raise RuntimeError(
-            f"Concord recovery: invalid common wave size {common_wave_size}"
-        )
+        raise RuntimeError(f"Concord recovery: invalid common wave size {common_wave_size}")
 
     for plan in (plan for plan in plans if plan.get('dual_failure')):
         targets = list(plan.get('failed_targets', []))
@@ -6979,9 +7188,7 @@ def _validate_recovery_alignment(
         for target in targets:
             role = int(target.get('original_role', -1))
             critical = role == int(StripeRole.SOURCE)
-            deferred = role in (
-                int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)
-            )
+            deferred = role in (int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET))
             if critical == deferred:
                 raise RuntimeError(
                     "Concord dual-failure target must be covered by exactly one recovery phase; "
@@ -6989,13 +7196,11 @@ def _validate_recovery_alignment(
                 )
             covered_targets += 1
         has_source = any(
-            int(target.get('original_role', -1)) == int(StripeRole.SOURCE)
-            for target in targets
+            int(target.get('original_role', -1)) == int(StripeRole.SOURCE) for target in targets
         )
         has_parity = any(
-            int(target.get('original_role', -1)) in (
-                int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)
-            )
+            int(target.get('original_role', -1))
+            in (int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET))
             for target in targets
         )
         if (
@@ -7010,14 +7215,9 @@ def _validate_recovery_alignment(
 
 
 def _build_recovery_parity_repair_context(
-    manager,
-    n: int,
-    job: _ConcordLayerRecoveryJob,
+    manager, n: int, job: _ConcordLayerRecoveryJob
 ) -> Tuple[List[Dict[str, Any]], Dict[int, bool]]:
-    parity_plans = [
-        p for p in manager.recovery_stripe_plans
-        if _is_parity_recovery_plan(p, n)
-    ]
+    parity_plans = [p for p in manager.recovery_stripe_plans if _is_parity_recovery_plan(p, n)]
     active_by_stripe = {int(plan['stripe_id']): True for plan in parity_plans}
     return parity_plans, active_by_stripe
 
@@ -7031,7 +7231,7 @@ def _prepare_recovery_parity_repair_buffers(
     preloaded_blocks: Dict[int, torch.Tensor],
     buf_pool: Optional[_RecoveryBufPool],
 ) -> Tuple[Dict[int, torch.Tensor], int, int, int]:
-    my_node = manager.rank_in_group + 1
+    my_node = int(manager.rank_in_group) + 1
     decoder_plans = [p for p in parity_plans if my_node == p['decoder_node']]
     helper_plans = [p for p in parity_plans if my_node in p['helper_nodes']]
     failed_plans = [p for p in parity_plans if _is_failed_in_recovery_plan(p, my_node)]
@@ -7063,13 +7263,9 @@ def _submit_recovery_parity_repair_window(
     slot_start: int,
     low_priority: bool,
 ) -> Dict[str, float]:
-    my_node = manager.rank_in_group + 1
+    my_node = int(manager.rank_in_group) + 1
     t_reset = time.time()
-    batch_id = (
-        native.begin_recovery_batch(True)
-        if low_priority
-        else native.begin_recovery_batch()
-    )
+    batch_id = native.begin_recovery_batch(True) if low_priority else native.begin_recovery_batch()
     reset_s = time.time() - t_reset
     t_submit = time.time()
     active_stripes = 0
@@ -7103,27 +7299,31 @@ def _submit_recovery_parity_repair_window(
                 for hi in range(len(stri_plan['helper_nodes'])):
                     if hi < len(recv_bufs):
                         decoder_helper_recv_addrs.append(
-                            int(recv_bufs[hi][:job.layer_block_size].data_ptr())
+                            int(recv_bufs[hi][: job.layer_block_size].data_ptr())
                         )
                 if buf_slot < len(buf_pool.decoder_recovered_bufs):
                     decoder_recovered_addrs.append(
-                        int(buf_pool.decoder_recovered_bufs[buf_slot][:job.layer_block_size].data_ptr())
+                        int(
+                            buf_pool.decoder_recovered_bufs[buf_slot][
+                                : job.layer_block_size
+                            ].data_ptr()
+                        )
                     )
-                if (
-                    stri_plan.get('dual_failure')
-                    and buf_slot < len(buf_pool.decoder_recovered_buf2s)
+                if stri_plan.get('dual_failure') and buf_slot < len(
+                    buf_pool.decoder_recovered_buf2s
                 ):
                     decoder_recovered_addrs.append(
-                        int(buf_pool.decoder_recovered_buf2s[buf_slot][:job.layer_block_size].data_ptr())
+                        int(
+                            buf_pool.decoder_recovered_buf2s[buf_slot][
+                                : job.layer_block_size
+                            ].data_ptr()
+                        )
                     )
 
         if _is_failed_in_recovery_plan(stri_plan, my_node):
-            if (
-                buf_pool is not None
-                and buf_slot < len(buf_pool.failed_recv_bufs)
-            ):
+            if buf_pool is not None and buf_slot < len(buf_pool.failed_recv_bufs):
                 failed_recv_buf_addr = int(
-                    buf_pool.failed_recv_bufs[buf_slot][:job.layer_block_size].data_ptr()
+                    buf_pool.failed_recv_bufs[buf_slot][: job.layer_block_size].data_ptr()
                 )
 
         native.submit_recovery_stripe_to_batch(
@@ -7142,7 +7342,8 @@ def _submit_recovery_parity_repair_window(
             active,
             (
                 [int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)]
-                if stri_plan.get('dual_failure') else []
+                if stri_plan.get('dual_failure')
+                else []
             ),
         )
 
@@ -7153,7 +7354,6 @@ def _submit_recovery_parity_repair_window(
         "submit_s": time.time() - t_submit,
         "active_stripes": float(active_stripes),
     }
-
 
 
 def _persist_recovered_parity_wave(
@@ -7182,24 +7382,24 @@ def _persist_recovered_parity_wave(
             raise RuntimeError("Concord parity persistence: missing failed receive slot")
         sid = int(plan['stripe_id'])
         parity_index = (
-            0 if role == int(StripeRole.ENCODER)
-            else int(manager.stripe_plans[sid].parity_index)
+            0 if role == int(StripeRole.ENCODER) else int(manager.stripe_plans[sid].parity_index)
         )
         stripe_dir = checkpoint_dir / job.layer_name / f"stripe_{sid}"
         stripe_dir.mkdir(parents=True, exist_ok=True)
-        path = stripe_dir / (
-            f"concord_shard_rank{rank}{_parity_shard_suffix(parity_index)}.pt"
-        )
-        block = buf_pool.failed_recv_bufs[slot][:job.layer_block_size]
+        path = stripe_dir / (f"concord_shard_rank{rank}{_parity_shard_suffix(parity_index)}.pt")
+        block = buf_pool.failed_recv_bufs[slot][: job.layer_block_size]
         if block.device.type != "cpu":
             block = block.cpu()
         header = struct.pack(
-            "<4sIIIQQ", b"CNBK", sid, int(role), parity_index,
-            int(job.layer_block_size), int(job.layer_block_size),
+            "<4sIIIQQ",
+            b"CNBK",
+            sid,
+            int(role),
+            parity_index,
+            int(job.layer_block_size),
+            int(job.layer_block_size),
         )
-        temp_path = path.with_name(
-            f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}"
-        )
+        temp_path = path.with_name(f".{path.name}.tmp.{os.getpid()}.{threading.get_ident()}")
         try:
             with open(temp_path, "wb") as file:
                 file.write(header)
@@ -7243,7 +7443,7 @@ def _submit_recovery_parity_repair(
     if not parity_plans:
         return timing
     my_blocks, decoder_count, helper_count, failed_count = _prepare_recovery_parity_repair_buffers(
-        native, manager, n, job, parity_plans, preloaded_blocks, buf_pool,
+        native, manager, n, job, parity_plans, preloaded_blocks, buf_pool
     )
     timing["decoder_stripes"] = float(decoder_count)
     timing["helper_stripes"] = float(helper_count)
@@ -7259,10 +7459,18 @@ def _submit_recovery_parity_repair(
     t_network = time.time()
     waves = 0
     for start in range(0, len(parity_plans), max_inflight):
-        wave_plans = parity_plans[start:start + max_inflight]
+        wave_plans = parity_plans[start : start + max_inflight]
         batch_timing = _submit_recovery_parity_repair_window(
-            native, manager, job, wave_plans, active_by_stripe,
-            my_blocks, buf_pool, n, 0, low_priority,
+            native,
+            manager,
+            job,
+            wave_plans,
+            active_by_stripe,
+            my_blocks,
+            buf_pool,
+            n,
+            0,
+            low_priority,
         )
         timing["submit_s"] += batch_timing.get("reset_s", 0.0) + batch_timing.get("submit_s", 0.0)
         wait_t0 = time.time()
@@ -7271,8 +7479,7 @@ def _submit_recovery_parity_repair(
         timing["wait_s"] += time.time() - wait_t0
         timing["persisted_shards"] = timing.get("persisted_shards", 0.0) + float(
             _persist_recovered_parity_wave(
-                wave_plans, job, manager, buf_pool, checkpoint_dir, rank,
-                persist_repaired_parity,
+                wave_plans, job, manager, buf_pool, checkpoint_dir, rank, persist_repaired_parity
             )
         )
         if hasattr(native, "get_recovery_batch_milestones"):
@@ -7283,7 +7490,6 @@ def _submit_recovery_parity_repair(
     timing["waves"] = float(waves)
     timing["network_batch_s"] = time.time() - t_network
     return timing
-
 
 
 def _set_pending_recovery_parity_repair(
@@ -7308,9 +7514,7 @@ def _set_pending_recovery_parity_repair(
         "parity_preloaded": parity_preloaded or {},
         "persist_repaired_parity": not _concord_inprocess_workspace_enabled(),
         "execution_mode": (
-            "async_background"
-            if _concord_recovery_async_parity_enabled()
-            else "sync_data_worker"
+            "async_background" if _concord_recovery_async_parity_enabled() else "sync_data_worker"
         ),
     }
 
@@ -7333,12 +7537,8 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
     pause_send_start = 0
     if hasattr(native, "get_recovery_batch_timing_stats"):
         native_timing = dict(native.get_recovery_batch_timing_stats())
-        pause_wait_start_s = float(
-            native_timing.get("low_priority_pause_wait_s", 0.0) or 0.0
-        )
-        pause_send_start = int(
-            native_timing.get("low_priority_send_tasks", 0.0) or 0.0
-        )
+        pause_wait_start_s = float(native_timing.get("low_priority_pause_wait_s", 0.0) or 0.0)
+        pause_send_start = int(native_timing.get("low_priority_send_tasks", 0.0) or 0.0)
     total_stripes = 0
     total_waves = 0
     total_submit_s = 0.0
@@ -7356,9 +7556,15 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
     try:
         for job in jobs:
             timing = _submit_recovery_parity_repair(
-                manager, native, job, preloaded.get(job.encode_iter, {}),
-                buf_pool, recovery_role, True,
-                Path(pending["checkpoint_dir"]), int(pending["rank"]),
+                manager,
+                native,
+                job,
+                preloaded.get(job.encode_iter, {}),
+                buf_pool,
+                recovery_role,
+                True,
+                Path(pending["checkpoint_dir"]),
+                int(pending["rank"]),
                 persist_repaired_parity,
             )
             total_stripes += int(timing.get("parity_stripes", 0.0))
@@ -7393,9 +7599,7 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
                 - pause_wait_start_s,
             )
             pause_send_tasks = max(
-                0,
-                int(native_timing.get("low_priority_send_tasks", 0.0) or 0.0)
-                - pause_send_start,
+                0, int(native_timing.get("low_priority_send_tasks", 0.0) or 0.0) - pause_send_start
             )
         _concord_recovery_profile(
             recovery_role,
@@ -7427,6 +7631,7 @@ def _run_recovery_parity_repair_submissions(pending: Dict[str, Any], reason: str
             return
         raise
 
+
 def _start_recovery_parity_repair_submissions(reason: str, role: str = "unknown") -> None:
     """Start parity repair submit work in the background after recovery completes."""
     global _pending_recovery_parity_repair, _recovery_async_parity_thread
@@ -7434,7 +7639,6 @@ def _start_recovery_parity_repair_submissions(reason: str, role: str = "unknown"
     if pending is None or _recovery_async_parity_thread is not None:
         return
     _pending_recovery_parity_repair = None
-    recovery_role = str(pending.get("recovery_role", role))
     pending["execution_mode"] = "async_background"
     worker = threading.Thread(
         target=_run_recovery_parity_repair_submissions,
@@ -7463,8 +7667,11 @@ def _finish_recovery_parity_repair_submissions(reason: str, role: str = "unknown
         worker.join()
         _recovery_async_parity_thread = None
         _concord_recovery_profile(
-            role, "recovery_parity_join_done", reason=reason,
-            elapsed_s=time.time() - t_join, mode="async_background",
+            role,
+            "recovery_parity_join_done",
+            reason=reason,
+            elapsed_s=time.time() - t_join,
+            mode="async_background",
         )
     if _recovery_async_parity_error is not None:
         exc = _recovery_async_parity_error
@@ -7494,9 +7701,7 @@ def _concord_recovery_lifecycle_needs_finish(
     )
 
 
-def _dispatch_recovery_parity_after_data_recovery(
-    role: str = "unknown",
-) -> None:
+def _dispatch_recovery_parity_after_data_recovery(role: str = "unknown") -> None:
     """Start deferred parity from the critical-phase completion context."""
     if _pending_recovery_parity_repair is None:
         return
@@ -7505,9 +7710,7 @@ def _dispatch_recovery_parity_after_data_recovery(
         "recovery_parity_dispatch",
         trigger="after_critical_recovery",
         mode=(
-            "async_background"
-            if _concord_recovery_async_parity_enabled()
-            else "sync_data_worker"
+            "async_background" if _concord_recovery_async_parity_enabled() else "sync_data_worker"
         ),
     )
     if _concord_recovery_async_parity_enabled():
@@ -7525,53 +7728,38 @@ def concord_start_or_run_recovery_parity_after_forward_backward() -> bool:
     return _concord_recovery_lifecycle_needs_finish(service)
 
 
-def concord_drain_recovery_parity(
-    reason: str, allow_start_pending: bool = True
-) -> None:
+def concord_drain_recovery_parity(reason: str, allow_start_pending: bool = True) -> None:
     """Drain pending parity repair in either sync or async execution mode."""
     service = _wait_recovery_data_before_parity(reason)
     if _pending_recovery_parity_repair is not None:
         if not allow_start_pending:
-            raise RuntimeError(
-                f"Concord recovery parity remains pending at {reason}"
-            )
+            raise RuntimeError(f"Concord recovery parity remains pending at {reason}")
         if _concord_recovery_async_parity_enabled():
             try:
                 _start_recovery_parity_repair_submissions(reason, service.role)
             except BaseException:
-                _run_pending_recovery_parity_repair_sync(
-                    f"{reason}_start_failure", service.role
-                )
+                _run_pending_recovery_parity_repair_sync(f"{reason}_start_failure", service.role)
                 raise
         else:
             _run_pending_recovery_parity_repair_sync(reason, service.role)
     if _pending_recovery_parity_repair is not None:
-        raise RuntimeError(
-            f"Concord recovery parity remains pending at {reason}"
-        )
+        raise RuntimeError(f"Concord recovery parity remains pending at {reason}")
     _finish_recovery_parity_repair_submissions(reason, service.role)
     _flush_recovery_async_parity(reason, service.role)
 
 
 def concord_wait_for_inline_parity_after_first_microbatch() -> bool:
     """Wait for synchronous hardware recovery parity after the first microbatch."""
-    if (
-        not _concord_recovery_parity_repair_enabled()
-        or _concord_recovery_async_parity_enabled()
-    ):
+    if not _concord_recovery_parity_repair_enabled() or _concord_recovery_async_parity_enabled():
         return False
     service = _get_active_concord_recovery_service()
     if not _concord_recovery_lifecycle_needs_finish(service):
         return False
     wait_t0 = time.time()
     _concord_recovery_profile(
-        service.role,
-        "inline_parity_tail_wait_start",
-        point="after_first_microbatch",
+        service.role, "inline_parity_tail_wait_start", point="after_first_microbatch"
     )
-    concord_drain_recovery_parity(
-        "after_first_microbatch", allow_start_pending=True
-    )
+    concord_drain_recovery_parity("after_first_microbatch", allow_start_pending=True)
     _concord_recovery_profile(
         service.role,
         "inline_parity_tail_wait_done",
@@ -7581,16 +7769,12 @@ def concord_wait_for_inline_parity_after_first_microbatch() -> bool:
     return True
 
 
-def concord_finish_recovery_parity_after_optimizer(
-    allow_start_pending: bool = True,
-) -> None:
+def concord_finish_recovery_parity_after_optimizer(allow_start_pending: bool = True) -> None:
     """Drain repair and release recovery-native resources after optimizer work."""
     service = _get_active_concord_recovery_service()
     if not _concord_recovery_lifecycle_needs_finish(service):
         return
-    concord_drain_recovery_parity(
-        "after_optimizer_step", allow_start_pending=allow_start_pending
-    )
+    concord_drain_recovery_parity("after_optimizer_step", allow_start_pending=allow_start_pending)
     if (
         _pending_recovery_parity_repair is None
         and _pending_optimizer_state is None
@@ -7601,9 +7785,7 @@ def concord_finish_recovery_parity_after_optimizer(
         service.state = service.TORN_DOWN
 
 
-def _run_pending_recovery_parity_repair_sync(
-    reason: str, role: str = "unknown"
-) -> None:
+def _run_pending_recovery_parity_repair_sync(reason: str, role: str = "unknown") -> None:
     """Run deferred parity repair synchronously after critical recovery."""
     global _pending_recovery_parity_repair
     pending = _pending_recovery_parity_repair
@@ -7649,6 +7831,7 @@ def _run_recovery_pipeline(
     pipeline_start_delay_s = 0.0
     try:
         from megatron.training.global_vars import get_recovery_to_forward_timer_start
+
         recovery_to_forward_start_s = get_recovery_to_forward_timer_start()
         if recovery_to_forward_start_s > 0.0:
             pipeline_start_delay_s = max(0.0, t_pipeline - recovery_to_forward_start_s)
@@ -7657,9 +7840,7 @@ def _run_recovery_pipeline(
     error_holder: Dict[str, Optional[BaseException]] = {"error": None}
 
     def _network_worker() -> None:
-        def _alloc_slots(
-            free_ranges: List[Tuple[int, int]], required: int
-        ) -> Optional[int]:
+        def _alloc_slots(free_ranges: List[Tuple[int, int]], required: int) -> Optional[int]:
             for idx, (start_slot, length) in enumerate(free_ranges):
                 if length < required:
                     continue
@@ -7671,9 +7852,7 @@ def _run_recovery_pipeline(
                 return alloc_start
             return None
 
-        def _free_slots(
-            free_ranges: List[Tuple[int, int]], start_slot: int, length: int
-        ) -> None:
+        def _free_slots(free_ranges: List[Tuple[int, int]], start_slot: int, length: int) -> None:
             free_ranges.append((start_slot, length))
             free_ranges.sort()
             merged: List[Tuple[int, int]] = []
@@ -7699,14 +7878,18 @@ def _run_recovery_pipeline(
             recovered.timing['wait_s'] = wait_s
             if checkpoint_dir is not None:
                 persisted = _persist_recovered_parity_wave(
-                    recovered.window.plans, job, manager, buf_pool,
-                    checkpoint_dir, rank, persist_repaired_parity,
+                    recovered.window.plans,
+                    job,
+                    manager,
+                    buf_pool,
+                    checkpoint_dir,
+                    rank,
+                    persist_repaired_parity,
                     recovered.window.slot_start,
                 )
-                layer_timing['persisted_mixed_parity_shards'] = (
-                    layer_timing.get('persisted_mixed_parity_shards', 0.0)
-                    + float(persisted)
-                )
+                layer_timing['persisted_mixed_parity_shards'] = layer_timing.get(
+                    'persisted_mixed_parity_shards', 0.0
+                ) + float(persisted)
             if hasattr(native, 'get_recovery_batch_milestones'):
                 _record_concord_native_batch_milestones(native, batch_id, job.layer_idx)
             batch_timing = {}
@@ -7720,22 +7903,27 @@ def _run_recovery_pipeline(
                 end_us = float(batch_timing.get(end_key, 0.0) or 0.0)
                 if start_us > 0.0:
                     old_start = float(layer_timing.get(start_key, 0.0) or 0.0)
-                    layer_timing[start_key] = start_us if old_start == 0.0 else min(old_start, start_us)
+                    layer_timing[start_key] = (
+                        start_us if old_start == 0.0 else min(old_start, start_us)
+                    )
                 if end_us > 0.0:
-                    layer_timing[end_key] = max(float(layer_timing.get(end_key, 0.0) or 0.0), end_us)
-            layer_timing['failed_cpu_copy_s'] = (
-                layer_timing.get('failed_cpu_copy_s', 0.0)
-                + float(batch_timing.get('failed_copy_s', 0.0) or 0.0)
+                    layer_timing[end_key] = max(
+                        float(layer_timing.get(end_key, 0.0) or 0.0), end_us
+                    )
+            layer_timing['failed_cpu_copy_s'] = layer_timing.get('failed_cpu_copy_s', 0.0) + float(
+                batch_timing.get('failed_copy_s', 0.0) or 0.0
             )
-            layer_timing['decoder_decode_sum_s'] = (
-                layer_timing.get('decoder_decode_sum_s', 0.0)
-                + float(batch_timing.get('decoder_decode_sum_s', 0.0) or 0.0)
-            )
+            layer_timing['decoder_decode_sum_s'] = layer_timing.get(
+                'decoder_decode_sum_s', 0.0
+            ) + float(batch_timing.get('decoder_decode_sum_s', 0.0) or 0.0)
             layer_timing['network_wait_s'] += wait_s
             layer_timing['wait_s'] = layer_timing['network_wait_s']
             _concord_recovery_profile(
-                recovery_role, "network_window_done", layer=job.layer_name,
-                layer_idx=job.layer_idx, wave=recovered.window.wave_idx,
+                recovery_role,
+                "network_window_done",
+                layer=job.layer_name,
+                layer_idx=job.layer_idx,
+                wave=recovered.window.wave_idx,
                 batch_id=recovered.timing.get('batch_id', 0),
                 wait_s=wait_s,
                 net_s=batch_timing.get('net_s', 0.0),
@@ -7755,8 +7943,14 @@ def _run_recovery_pipeline(
             job_network_start: Dict[int, float] = {}
             for job in jobs:
                 windows, my_blocks, layer_timing = _iter_recovery_windows_for_job(
-                    job, manager, native, n, rank,
-                    preloaded.get(job.encode_iter, {}), buf_pool, recovery_role,
+                    job,
+                    manager,
+                    native,
+                    n,
+                    rank,
+                    preloaded.get(job.encode_iter, {}),
+                    buf_pool,
+                    recovery_role,
                 )
                 aggregate_timing[id(job)] = layer_timing
                 job_windows[id(job)] = windows
@@ -7792,18 +7986,22 @@ def _run_recovery_pipeline(
                 layer_timing = aggregate_timing.get(id(job), {})
                 if id(job) not in job_network_start:
                     job_network_start[id(job)] = time.time()
-                timing = _submit_recovery_window(
-                    native, manager, window, my_blocks, buf_pool, n,
+                timing = _submit_recovery_window(native, manager, window, my_blocks, buf_pool, n)
+                layer_timing['network_submit_s'] += timing.get('reset_s', 0.0) + timing.get(
+                    'submit_s', 0.0
                 )
-                layer_timing['network_submit_s'] += timing.get('reset_s', 0.0) + timing.get('submit_s', 0.0)
                 layer_timing['submit_s'] = layer_timing['network_submit_s']
                 recovered = _ConcordRecoveredWindow(window=window, timing=timing)
                 active_windows.append((recovered, slot_start, required_slots))
                 idx += 1
                 _concord_recovery_profile(
-                    recovery_role, "network_window_submitted", layer=job.layer_name,
-                    layer_idx=job.layer_idx, wave=window.wave_idx,
-                    batch_id=timing.get('batch_id', 0), stripes=len(window.plans),
+                    recovery_role,
+                    "network_window_submitted",
+                    layer=job.layer_name,
+                    layer_idx=job.layer_idx,
+                    wave=window.wave_idx,
+                    batch_id=timing.get('batch_id', 0),
+                    stripes=len(window.plans),
                     active_stripes=int(timing.get('active_stripes', 0.0)),
                     skipped_padding_stripes=(
                         len(window.plans) - int(timing.get('active_stripes', 0.0))
@@ -7826,9 +8024,7 @@ def _run_recovery_pipeline(
             completed.put(None)
 
     network_thread = threading.Thread(
-        target=_network_worker,
-        name=f"concord-recovery-network-rank{rank}",
-        daemon=False,
+        target=_network_worker, name=f"concord-recovery-network-rank{rank}", daemon=False
     )
     network_thread.start()
     materialized_jobs: Set[int] = set()
@@ -7847,21 +8043,27 @@ def _run_recovery_pipeline(
         if item.window.wave_idx + 1 < int(layer_timing.get('waves', 0)):
             continue
         record, materialize_timing = _materialize_recovered_layer(
-            job, manager, is_failed, item.window.layer_buf, full_buf,
-            global_tensor_infos, runtime=runtime, map_to_full_buf=map_to_full_buf,
+            job,
+            manager,
+            is_failed,
+            item.window.layer_buf,
+            full_buf,
+            global_tensor_infos,
+            runtime=runtime,
+            map_to_full_buf=map_to_full_buf,
             clone_runtime_tensors=clone_runtime_tensors,
-            recovery_role=recovery_role, tensor_views_by_key=tensor_views_by_key,
+            recovery_role=recovery_role,
+            tensor_views_by_key=tensor_views_by_key,
         )
         layer_timing.update(materialize_timing)
-        layer_timing['job_total_s'] = (
-            layer_timing.get('network_batch_s', 0.0)
-            + layer_timing.get('materialize_s', 0.0)
+        layer_timing['job_total_s'] = layer_timing.get('network_batch_s', 0.0) + layer_timing.get(
+            'materialize_s', 0.0
         )
         results.append((record, layer_timing))
         if common_readiness is not None and is_failed:
             common_readiness.publish(
                 _extract_layer_tensors_from_buf(
-                    item.window.layer_buf, job.layer_infos, clone_storage=False,
+                    item.window.layer_buf, job.layer_infos, clone_storage=False
                 )
             )
         materialized_jobs.add(id(job))
@@ -7874,7 +8076,9 @@ def _run_recovery_pipeline(
         if record is None or job.layer_idx < 0:
             last_common_done["time"] = done_time
         _concord_recovery_profile(
-            recovery_role, "pipeline_job_done", layer=job.layer_name,
+            recovery_role,
+            "pipeline_job_done",
+            layer=job.layer_name,
             layer_idx=job.layer_idx,
             network_batch_s=layer_timing.get('network_batch_s', 0.0),
             network_submit_s=layer_timing.get('network_submit_s', 0.0),
@@ -7902,7 +8106,11 @@ def _run_recovery_pipeline(
     net_ends = [float(timing.get('net_end_us', 0.0) or 0.0) for _record, timing in results]
     net_start_us = min((value for value in net_starts if value > 0.0), default=0.0)
     net_end_us = max(net_ends, default=0.0)
-    total_recovery_net_s = ((net_end_us - net_start_us) / 1.0e6) if net_start_us > 0.0 and net_end_us > net_start_us else 0.0
+    total_recovery_net_s = (
+        ((net_end_us - net_start_us) / 1.0e6)
+        if net_start_us > 0.0 and net_end_us > net_start_us
+        else 0.0
+    )
     total_recovery_decode_s = sum(
         timing.get('decoder_decode_sum_s', 0.0) for _record, timing in results
     )
@@ -7915,15 +8123,11 @@ def _run_recovery_pipeline(
     first_network_done_s = (
         first_network_done["time"] - t_pipeline if first_network_done["time"] else 0.0
     )
-    last_model_done_s = (
-        last_model_done["time"] - t_pipeline if last_model_done["time"] else 0.0
-    )
+    last_model_done_s = last_model_done["time"] - t_pipeline if last_model_done["time"] else 0.0
     last_optimizer_done_s = (
         last_optimizer_done["time"] - t_pipeline if last_optimizer_done["time"] else 0.0
     )
-    last_common_done_s = (
-        last_common_done["time"] - t_pipeline if last_common_done["time"] else 0.0
-    )
+    last_common_done_s = last_common_done["time"] - t_pipeline if last_common_done["time"] else 0.0
     last_materialize_done_s = (
         last_materialize_done["time"] - t_pipeline if last_materialize_done["time"] else 0.0
     )
@@ -7946,11 +8150,11 @@ def _run_recovery_pipeline(
     }
     try:
         from megatron.training.global_vars import stash_recovery_timing_summary
+
         stash_recovery_timing_summary("concord_hw_pipeline", summary)
     except Exception:
         pass
     return results
-
 
 
 def _start_layer_recovery_worker(
@@ -7980,13 +8184,25 @@ def _start_layer_recovery_worker(
     def _worker() -> None:
         t_worker = time.time()
         _concord_recovery_profile(
-            recovery_role, "worker_start", jobs=len(jobs),
-            map_to_full_buf=map_to_full_buf, cleanup_after=cleanup_after,
+            recovery_role,
+            "worker_start",
+            jobs=len(jobs),
+            map_to_full_buf=map_to_full_buf,
+            cleanup_after=cleanup_after,
         )
         try:
             _run_recovery_pipeline(
-                jobs, manager, native, n, rank, is_failed, preloaded,
-                buf_pool, full_buf, global_tensor_infos, runtime=runtime,
+                jobs,
+                manager,
+                native,
+                n,
+                rank,
+                is_failed,
+                preloaded,
+                buf_pool,
+                full_buf,
+                global_tensor_infos,
+                runtime=runtime,
                 map_to_full_buf=map_to_full_buf,
                 clone_runtime_tensors=clone_runtime_tensors,
                 recovery_role=recovery_role,
@@ -8020,14 +8236,15 @@ def _start_layer_recovery_worker(
                         if job.layer_idx >= 0:
                             runtime.mark_layer_error(job.layer_idx, error_text)
             _concord_recovery_profile(
-                recovery_role, "worker_done", jobs=len(jobs),
-                elapsed_s=time.time() - t_worker, cleanup_after=cleanup_after,
+                recovery_role,
+                "worker_done",
+                jobs=len(jobs),
+                elapsed_s=time.time() - t_worker,
+                cleanup_after=cleanup_after,
             )
 
     worker = threading.Thread(
-        target=_worker,
-        name=f"concord-layer-recovery-rank{rank}",
-        daemon=False,
+        target=_worker, name=f"concord-layer-recovery-rank{rank}", daemon=False
     )
     setattr(worker, "_concord_error_holder", error_holder)
     setattr(worker, "_concord_recovery_role", recovery_role)
@@ -8037,11 +8254,7 @@ def _start_layer_recovery_worker(
 
 
 def _normalize_stripe_block(
-    blk: Optional[torch.Tensor],
-    layer_block_size: int,
-    rank: int,
-    layer_name: str,
-    stripe_id: int,
+    blk: Optional[torch.Tensor], layer_block_size: int, rank: int, layer_name: str, stripe_id: int
 ) -> torch.Tensor:
     """Pad/truncate a stripe block to layer_block_size."""
     if blk is None or blk.numel() == 0:
@@ -8051,13 +8264,17 @@ def _normalize_stripe_block(
         )
     if blk.numel() < layer_block_size:
         padded = torch.zeros(layer_block_size, dtype=torch.uint8)
-        padded[:blk.numel()] = blk
+        padded[: blk.numel()] = blk
         return padded
     if blk.numel() > layer_block_size:
         logger.warning(
             "Concord recovery: rank %d layer %s stripe %d block exceeds "
             "layer_block_size (%d > %d), truncating",
-            rank, layer_name, stripe_id, blk.numel(), layer_block_size,
+            rank,
+            layer_name,
+            stripe_id,
+            blk.numel(),
+            layer_block_size,
         )
         return blk[:layer_block_size].contiguous()
     return blk.contiguous()
@@ -8077,23 +8294,20 @@ def _preload_recovery_stripe_blocks(
     """Read decoder/helper stripe blocks keyed by encode iteration index."""
     import concurrent.futures
 
-    result: Dict[int, Dict[int, torch.Tensor]] = {
-        i: {} for i in range(n_encode_iters)
-    }
+    result: Dict[int, Dict[int, torch.Tensor]] = {i: {} for i in range(n_encode_iters)}
     if not recovery_stripe_plans:
         return result
 
     participating = [
-        p for p in recovery_stripe_plans
+        p
+        for p in recovery_stripe_plans
         if my_node == p['decoder_node'] or my_node in p['helper_nodes']
     ]
     if not participating:
         return result
 
     my_order = all_layer_order.get(rank, [])
-    participant_concord_dir = (
-        all_concord_dirs[rank] if rank < len(all_concord_dirs) else None
-    )
+    participant_concord_dir = all_concord_dirs[rank] if rank < len(all_concord_dirs) else None
     if participant_concord_dir is None:
         logger.warning("Concord recovery: missing concord dir for participant=%d", rank)
         return result
@@ -8103,19 +8317,20 @@ def _preload_recovery_stripe_blocks(
     source_block_idx_by_sid: Dict[int, int] = {}
     for plan in sorted(participating, key=lambda p: int(p['stripe_id'])):
         sid = int(plan['stripe_id'])
-        if _stripe_role_for_node(ConcordManager(), sid, my_node, ConcordManager().concord_n) == int(StripeRole.SOURCE):
+        if _stripe_role_for_node(ConcordManager(), sid, my_node, ConcordManager().concord_n) == int(
+            StripeRole.SOURCE
+        ):
             source_block_idx_by_sid[sid] = len(source_block_idx_by_sid)
     n_source = (
         sum(1 for plan in stripe_plans if my_node in plan.source_node_ids)
-        if stripe_plans else len(source_block_idx_by_sid)
+        if stripe_plans
+        else len(source_block_idx_by_sid)
     )
 
     def _load_one(job: Tuple[int, Dict]) -> Tuple[int, int, int, torch.Tensor]:
         encode_iter, plan = job
         sid = int(plan['stripe_id'])
-        role = _stripe_role_for_node(
-            ConcordManager(), sid, my_node, ConcordManager().concord_n,
-        )
+        role = _stripe_role_for_node(ConcordManager(), sid, my_node, ConcordManager().concord_n)
         if encode_iter >= len(my_order):
             raise RuntimeError(
                 "Concord recovery: group layer order mismatch during preload "
@@ -8123,19 +8338,16 @@ def _preload_recovery_stripe_blocks(
             )
         layer_name = my_order[encode_iter]
         meta = all_layer_metadata.get(rank, {}).get(layer_name, {})
-        layer_block_size = int(
-            meta.get("block_size", saved_block_size) or saved_block_size
-        )
+        layer_block_size = int(meta.get("block_size", saved_block_size) or saved_block_size)
         sid = int(plan['stripe_id'])
         if role == int(StripeRole.SOURCE):
             blk_idx = (
                 _source_blk_idx_for_node_stripe(stripe_plans, int(sid), my_node)
-                if stripe_plans else source_block_idx_by_sid.get(int(sid), -1)
+                if stripe_plans
+                else source_block_idx_by_sid.get(int(sid), -1)
             )
             n_filled = _n_filled_blocks_for_layer(
-                int(meta.get("actual_tensor_size", 0)),
-                layer_block_size,
-                n_source,
+                int(meta.get("actual_tensor_size", 0)), layer_block_size, n_source
             )
             if blk_idx >= n_filled:
                 return encode_iter, sid, role, torch.zeros(layer_block_size, dtype=torch.uint8)
@@ -8144,25 +8356,13 @@ def _preload_recovery_stripe_blocks(
         if cached is not None and cached.numel() >= layer_block_size:
             blk = cached
         else:
-            blk = _read_stripe_block(
-                participant_concord_dir,
-                layer_name,
-                sid,
-                rank,
-                role,
-            )
-            blk = _normalize_stripe_block(
-                blk, layer_block_size, rank, layer_name, sid,
-            )
+            blk = _read_stripe_block(participant_concord_dir, layer_name, sid, rank, role)
+            blk = _normalize_stripe_block(blk, layer_block_size, rank, layer_name, sid)
             if cache_key not in cache:
                 cache[cache_key] = blk
         return encode_iter, sid, role, blk
 
-    jobs = [
-        (encode_iter, plan)
-        for encode_iter in range(n_encode_iters)
-        for plan in participating
-    ]
+    jobs = [(encode_iter, plan) for encode_iter in range(n_encode_iters) for plan in participating]
     if not jobs:
         return result
     n_workers = min(len(jobs), 8)
@@ -8212,7 +8412,8 @@ def _prep_survivor_hw_disk(
     my_order = all_layer_order.get(rank, [])
     if preload_recovery and recovery_stripe_plans:
         participating = [
-            p for p in recovery_stripe_plans
+            p
+            for p in recovery_stripe_plans
             if my_node == p['decoder_node'] or my_node in p['helper_nodes']
         ]
         for encode_iter in range(n_encode_iters):
@@ -8235,9 +8436,7 @@ def _prep_survivor_hw_disk(
         cache_source_keys=cache_source_keys,
     )
 
-    preloaded: Dict[int, Dict[int, torch.Tensor]] = {
-        i: {} for i in range(n_encode_iters)
-    }
+    preloaded: Dict[int, Dict[int, torch.Tensor]] = {i: {} for i in range(n_encode_iters)}
     if preload_recovery:
         preloaded = _preload_recovery_stripe_blocks(
             n_encode_iters,
@@ -8257,6 +8456,7 @@ def _prep_survivor_hw_disk(
 # Per-layer recovery pipeline (C++ batch network)
 # ---------------------------------------------------------------------------
 
+
 def _is_data_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
     """Return whether a plan has a target for the critical SOURCE phase."""
     if plan.get('dual_failure'):
@@ -8271,9 +8471,8 @@ def _is_parity_recovery_plan(plan: Dict[str, Any], n: int) -> bool:
     """Return whether a plan has a target for deferred parity repair."""
     if plan.get('dual_failure'):
         return any(
-            int(target.get('original_role', -1)) in (
-                int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)
-            )
+            int(target.get('original_role', -1))
+            in (int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET))
             for target in plan.get('failed_targets', [])
         )
     return not _is_data_recovery_plan(plan, n)
@@ -8298,20 +8497,10 @@ def _recovery_window_rows(n: int) -> int:
 
 
 def _build_recovery_layer_context(
-    manager,
-    n: int,
-    job: _ConcordLayerRecoveryJob,
-    layer_total_bytes: int,
-    layer_block_size: int,
+    manager, n: int, job: _ConcordLayerRecoveryJob, layer_total_bytes: int, layer_block_size: int
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[int, bool], int, int]:
-    raw_data_plans = [
-        p for p in manager.recovery_stripe_plans
-        if _is_data_recovery_plan(p, n)
-    ]
-    parity_plans = [
-        p for p in manager.recovery_stripe_plans
-        if _is_parity_recovery_plan(p, n)
-    ]
+    raw_data_plans = [p for p in manager.recovery_stripe_plans if _is_data_recovery_plan(p, n)]
+    parity_plans = [p for p in manager.recovery_stripe_plans if _is_parity_recovery_plan(p, n)]
     num_source_stripes = (n - 1) * int(manager.concord_k)
     target_filled = {
         int(node): _n_filled_blocks_for_layer(size, layer_block_size, num_source_stripes)
@@ -8329,9 +8518,7 @@ def _build_recovery_layer_context(
             if original_role != int(StripeRole.SOURCE):
                 continue
             failed_node = int(target.get('failed_node', -1))
-            blk_idx = _source_blk_idx_for_node_stripe(
-                manager.stripe_plans, sid, failed_node,
-            )
+            blk_idx = _source_blk_idx_for_node_stripe(manager.stripe_plans, sid, failed_node)
             source_validity.append(blk_idx < target_filled.get(failed_node, 0))
         # The critical phase selects SOURCE targets only. Skip a stripe only when
         # every selected SOURCE target is padding.
@@ -8341,7 +8528,7 @@ def _build_recovery_layer_context(
             active = not enable_padding_skip
         active_by_stripe[sid] = active
     local_filled = _n_filled_blocks_for_layer(
-        layer_total_bytes, layer_block_size, num_source_stripes,
+        layer_total_bytes, layer_block_size, num_source_stripes
     )
     return raw_data_plans, parity_plans, active_by_stripe, skipped_padding_stripes, local_filled
 
@@ -8356,8 +8543,8 @@ def _prepare_recovery_layer_buffers(
     preloaded_blocks: Dict[int, torch.Tensor],
     buf_pool: Optional[_RecoveryBufPool],
 ) -> Tuple[Dict[int, torch.Tensor], Optional[torch.Tensor], int, int, int]:
-    my_node = manager.rank_in_group + 1
     num_source_stripes = (n - 1) * int(manager.concord_k)
+    my_node = int(manager.rank_in_group) + 1
     decoder_stripes = [p for p in data_plans if my_node == p['decoder_node']]
     helper_stripes = [p for p in data_plans if my_node in p['helper_nodes']]
     failed_stripes = [p for p in data_plans if _is_failed_in_recovery_plan(p, my_node)]
@@ -8385,7 +8572,7 @@ def _prepare_recovery_layer_buffers(
             layer_buf = buf_pool.failed_layer_buf[: num_source_stripes * layer_block_size]
         else:
             layer_buf = allocate_hugepage_tensor(
-                num_source_stripes * layer_block_size, fallback_pin_memory=True,
+                num_source_stripes * layer_block_size, fallback_pin_memory=True
             )
             native.register_recovery_buffer(layer_buf.data_ptr(), layer_buf.numel())
 
@@ -8409,7 +8596,7 @@ def _submit_recovery_window(
     buf_pool: Optional[_RecoveryBufPool],
     n: int,
 ) -> Dict[str, float]:
-    my_node = manager.rank_in_group + 1
+    my_node = int(manager.rank_in_group) + 1
     job = window.job
     t_reset = time.time()
     batch_id = native.begin_recovery_batch()
@@ -8449,21 +8636,16 @@ def _submit_recovery_window(
                 )
                 for hi in range(len(stri_plan['helper_nodes'])):
                     if hi < len(recv_bufs):
-                        rb = recv_bufs[hi][:job.layer_block_size]
+                        rb = recv_bufs[hi][: job.layer_block_size]
                         decoder_helper_recv_addrs.append(rb.data_ptr())
                 if buf_slot < len(buf_pool.decoder_recovered_bufs):
                     rec_buf = buf_pool.decoder_recovered_bufs[buf_slot]
-                    decoder_recovered_addrs.append(
-                        rec_buf[:job.layer_block_size].data_ptr()
-                    )
-                if (
-                    stri_plan.get('dual_failure')
-                    and buf_slot < len(buf_pool.decoder_recovered_buf2s)
+                    decoder_recovered_addrs.append(rec_buf[: job.layer_block_size].data_ptr())
+                if stri_plan.get('dual_failure') and buf_slot < len(
+                    buf_pool.decoder_recovered_buf2s
                 ):
                     rec_buf2 = buf_pool.decoder_recovered_buf2s[buf_slot]
-                    decoder_recovered_addrs.append(
-                        rec_buf2[:job.layer_block_size].data_ptr()
-                    )
+                    decoder_recovered_addrs.append(rec_buf2[: job.layer_block_size].data_ptr())
 
         if _is_failed_in_recovery_plan(stri_plan, my_node):
             if window.layer_buf is not None:
@@ -8479,25 +8661,21 @@ def _submit_recovery_window(
                     )
                 failed_layer_offset = blk_idx * job.layer_block_size
                 failed_ncopy = min(
-                    job.layer_block_size,
-                    max(0, job.actual_size - failed_layer_offset),
+                    job.layer_block_size, max(0, job.actual_size - failed_layer_offset)
                 )
                 if failed_ncopy == job.layer_block_size:
-                    failed_recv_buf_addr = (
-                        window.layer_buf[
-                            failed_layer_offset:
-                            failed_layer_offset + job.layer_block_size
-                        ].data_ptr()
-                    )
+                    failed_recv_buf_addr = window.layer_buf[
+                        failed_layer_offset : failed_layer_offset + job.layer_block_size
+                    ].data_ptr()
                     store_to_layer_buf = False
             if (
                 failed_recv_buf_addr == 0
                 and buf_pool is not None
                 and buf_slot < len(buf_pool.failed_recv_bufs)
             ):
-                failed_recv_buf_addr = (
-                    buf_pool.failed_recv_bufs[buf_slot][:job.layer_block_size].data_ptr()
-                )
+                failed_recv_buf_addr = buf_pool.failed_recv_bufs[buf_slot][
+                    : job.layer_block_size
+                ].data_ptr()
 
         native.submit_recovery_stripe_to_batch(
             batch_id,
@@ -8541,28 +8719,26 @@ def _submit_recovery_network(
     recovery_role: str = "unknown",
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """Submit one layer of stripe recovery via C++ batch pipeline."""
-    my_node = manager.rank_in_group + 1
+    my_node = int(manager.rank_in_group) + 1
     layer_timing: Dict[str, float] = {
-        'rdma_xfer_s': 0.0, 'decode_s': 0.0, 'network_batch_s': 0.0,
-        'submit_s': 0.0, 'wait_s': 0.0, 'waves': 0,
+        'rdma_xfer_s': 0.0,
+        'decode_s': 0.0,
+        'network_batch_s': 0.0,
+        'submit_s': 0.0,
+        'wait_s': 0.0,
+        'waves': 0,
     }
 
     if not manager.recovery_stripe_plans:
         return None, layer_timing
 
-    raw_data_plans = [
-        p for p in manager.recovery_stripe_plans
-        if _is_data_recovery_plan(p, n)
-    ]
-    parity_plans = [
-        p for p in manager.recovery_stripe_plans
-        if _is_parity_recovery_plan(p, n)
-    ]
+    raw_data_plans = [p for p in manager.recovery_stripe_plans if _is_data_recovery_plan(p, n)]
+    parity_plans = [p for p in manager.recovery_stripe_plans if _is_parity_recovery_plan(p, n)]
 
     _dbg = _concord_debug_enabled()
     num_source_stripes = (n - 1) * int(manager.concord_k)
     n_filled_blocks = _n_filled_blocks_for_layer(
-        layer_total_bytes, layer_block_size, num_source_stripes,
+        layer_total_bytes, layer_block_size, num_source_stripes
     )
     data_plans: List[Dict[str, Any]] = []
     skipped_padding_stripes = 0
@@ -8577,9 +8753,7 @@ def _submit_recovery_network(
                 if int(target.get('original_role', -1)) != int(StripeRole.SOURCE):
                     continue
                 failed_node = int(target.get('failed_node', -1))
-                blk_idx = _source_blk_idx_for_node_stripe(
-                    manager.stripe_plans, sid, failed_node,
-                )
+                blk_idx = _source_blk_idx_for_node_stripe(manager.stripe_plans, sid, failed_node)
                 source_validity.append(blk_idx < n_filled_blocks)
             if source_validity and not any(source_validity):
                 skipped_padding_stripes += 1
@@ -8588,9 +8762,7 @@ def _submit_recovery_network(
             original_role = int(plan.get('original_role', -1))
             if original_role == int(StripeRole.SOURCE):
                 failed_node = int(plan.get('failed_node', -1))
-                blk_idx = _source_blk_idx_for_node_stripe(
-                    manager.stripe_plans, sid, failed_node,
-                )
+                blk_idx = _source_blk_idx_for_node_stripe(manager.stripe_plans, sid, failed_node)
                 if blk_idx >= n_filled_blocks:
                     skipped_padding_stripes += 1
                     active = not enable_padding_skip
@@ -8602,15 +8774,16 @@ def _submit_recovery_network(
             logger.debug(
                 "Concord recovery layer %s: rank %d has no critical SOURCE stripes "
                 "(skipped parity stripes=%d padding stripes=%d)",
-                layer_name, rank, len(parity_plans), skipped_padding_stripes,
+                layer_name,
+                rank,
+                len(parity_plans),
+                skipped_padding_stripes,
             )
         return None, layer_timing
 
     decoder_stripes = [p for p in data_plans if my_node == p['decoder_node']]
     helper_stripes = [p for p in data_plans if my_node in p['helper_nodes']]
-    failed_stripes = [
-        p for p in data_plans if _is_failed_in_recovery_plan(p, my_node)
-    ]
+    failed_stripes = [p for p in data_plans if _is_failed_in_recovery_plan(p, my_node)]
     is_failed = len(failed_stripes) > 0
 
     if _dbg:
@@ -8618,10 +8791,17 @@ def _submit_recovery_network(
             "Concord recovery layer %s: rank %d — critical=%d raw_critical=%d "
             "parity_deferred=%d padding_skipped=%d filled=%d/%d "
             "decoder=%d helper=%d failed=%d stripes",
-            layer_name, rank, len(data_plans), len(raw_data_plans),
-            len(parity_plans), skipped_padding_stripes,
-            n_filled_blocks, num_source_stripes,
-            len(decoder_stripes), len(helper_stripes), len(failed_stripes),
+            layer_name,
+            rank,
+            len(data_plans),
+            len(raw_data_plans),
+            len(parity_plans),
+            skipped_padding_stripes,
+            n_filled_blocks,
+            num_source_stripes,
+            len(decoder_stripes),
+            len(helper_stripes),
+            len(failed_stripes),
         )
 
     my_blocks: Dict[int, torch.Tensor] = {}
@@ -8647,7 +8827,7 @@ def _submit_recovery_network(
             layer_buf = buf_pool.failed_layer_buf[: num_source_stripes * layer_block_size]
         else:
             layer_buf = allocate_hugepage_tensor(
-                num_source_stripes * layer_block_size, fallback_pin_memory=True,
+                num_source_stripes * layer_block_size, fallback_pin_memory=True
             )
             native.register_recovery_buffer(layer_buf.data_ptr(), layer_buf.numel())
 
@@ -8656,7 +8836,7 @@ def _submit_recovery_network(
     wave_size = buf_pool.concurrency if buf_pool is not None else max(n, 1)
     t_network = time.time()
     for wave_start in range(0, len(data_plans), wave_size):
-        wave_plans = data_plans[wave_start:wave_start + wave_size]
+        wave_plans = data_plans[wave_start : wave_start + wave_size]
         wave_idx = int(wave_start / wave_size)
         layer_timing['waves'] += 1
         t_reset = time.time()
@@ -8701,17 +8881,12 @@ def _submit_recovery_network(
                             decoder_helper_recv_addrs.append(rb.data_ptr())
                     if buf_slot < len(buf_pool.decoder_recovered_bufs):
                         rec_buf = buf_pool.decoder_recovered_bufs[buf_slot]
-                        decoder_recovered_addrs.append(
-                            rec_buf[:layer_block_size].data_ptr()
-                        )
-                    if (
-                        stri_plan.get('dual_failure')
-                        and buf_slot < len(buf_pool.decoder_recovered_buf2s)
+                        decoder_recovered_addrs.append(rec_buf[:layer_block_size].data_ptr())
+                    if stri_plan.get('dual_failure') and buf_slot < len(
+                        buf_pool.decoder_recovered_buf2s
                     ):
                         rec_buf2 = buf_pool.decoder_recovered_buf2s[buf_slot]
-                        decoder_recovered_addrs.append(
-                            rec_buf2[:layer_block_size].data_ptr()
-                        )
+                        decoder_recovered_addrs.append(rec_buf2[:layer_block_size].data_ptr())
 
             if _is_failed_in_recovery_plan(stri_plan, my_node):
                 if layer_buf is not None:
@@ -8726,26 +8901,18 @@ def _submit_recovery_network(
                 else:
                     original_role = stri_plan.get('original_role')
 
-                if (
-                    active
-                    and layer_buf is not None
-                    and original_role == int(StripeRole.SOURCE)
-                ):
+                if active and layer_buf is not None and original_role == int(StripeRole.SOURCE):
                     store_to_layer_buf = True
                     blk_idx = src_block_per_node[my_node]
                     src_block_per_node[my_node] += 1
                     failed_layer_offset = blk_idx * layer_block_size
                     failed_ncopy = min(
-                        layer_block_size,
-                        max(0, layer_total_bytes - failed_layer_offset),
+                        layer_block_size, max(0, layer_total_bytes - failed_layer_offset)
                     )
                     if failed_ncopy == layer_block_size:
-                        failed_recv_buf_addr = (
-                            layer_buf[
-                                failed_layer_offset:
-                                failed_layer_offset + layer_block_size
-                            ].data_ptr()
-                        )
+                        failed_recv_buf_addr = layer_buf[
+                            failed_layer_offset : failed_layer_offset + layer_block_size
+                        ].data_ptr()
                         store_to_layer_buf = False
 
                 if (
@@ -8753,9 +8920,9 @@ def _submit_recovery_network(
                     and buf_pool is not None
                     and buf_slot < len(buf_pool.failed_recv_bufs)
                 ):
-                    failed_recv_buf_addr = (
-                        buf_pool.failed_recv_bufs[buf_slot][:layer_block_size].data_ptr()
-                    )
+                    failed_recv_buf_addr = buf_pool.failed_recv_bufs[buf_slot][
+                        :layer_block_size
+                    ].data_ptr()
 
             native.submit_recovery_stripe(
                 sid,
@@ -8780,45 +8947,64 @@ def _submit_recovery_network(
         layer_timing['submit_s'] += submit_s + reset_s
         layer_timing['wait_s'] += wait_s
         _concord_recovery_profile(
-            recovery_role, "network_wave_done", layer=layer_name,
-            layer_idx=layer_idx, wave=wave_idx, stripes=len(wave_plans),
-            wave_size=wave_size, pool_concurrency=(buf_pool.concurrency if buf_pool is not None else 0),
+            recovery_role,
+            "network_wave_done",
+            layer=layer_name,
+            layer_idx=layer_idx,
+            wave=wave_idx,
+            stripes=len(wave_plans),
+            wave_size=wave_size,
+            pool_concurrency=(buf_pool.concurrency if buf_pool is not None else 0),
             active_stripes=wave_active_stripes,
             skipped_padding_stripes=len(wave_plans) - wave_active_stripes,
-            reset_s=reset_s, submit_s=submit_s, wait_s=wait_s,
+            reset_s=reset_s,
+            submit_s=submit_s,
+            wait_s=wait_s,
         )
 
     layer_timing['network_batch_s'] = time.time() - t_network
     layer_timing['rdma_xfer_s'] = layer_timing['network_batch_s']
     _concord_recovery_profile(
-        recovery_role, "network_batch_done", layer=layer_name,
-        layer_idx=layer_idx, stripes=len(data_plans),
+        recovery_role,
+        "network_batch_done",
+        layer=layer_name,
+        layer_idx=layer_idx,
+        stripes=len(data_plans),
         raw_stripes=len(raw_data_plans),
-        active_stripes=sum(1 for plan in data_plans if active_by_stripe.get(int(plan['stripe_id']), True)),
+        active_stripes=sum(
+            1 for plan in data_plans if active_by_stripe.get(int(plan['stripe_id']), True)
+        ),
         skipped_padding_stripes=(
             sum(1 for plan in data_plans if not active_by_stripe.get(int(plan['stripe_id']), True))
         ),
         padding_candidate_stripes=skipped_padding_stripes,
         padding_skip_enabled=enable_padding_skip,
         n_filled_blocks=n_filled_blocks,
-        decoder_stripes=len(decoder_stripes), helper_stripes=len(helper_stripes),
-        failed_stripes=len(failed_stripes), waves=layer_timing['waves'],
-        wave_size=wave_size, pool_concurrency=(buf_pool.concurrency if buf_pool is not None else 0),
+        decoder_stripes=len(decoder_stripes),
+        helper_stripes=len(helper_stripes),
+        failed_stripes=len(failed_stripes),
+        waves=layer_timing['waves'],
+        wave_size=wave_size,
+        pool_concurrency=(buf_pool.concurrency if buf_pool is not None else 0),
         network_batch_s=layer_timing['network_batch_s'],
-        submit_s=layer_timing['submit_s'], wait_s=layer_timing['wait_s'],
+        submit_s=layer_timing['submit_s'],
+        wait_s=layer_timing['wait_s'],
     )
 
     if is_failed:
         n_stored = src_block_per_node.get(my_node, 0)
         expected_stored = sum(
-            1 for plan in failed_stripes
+            1
+            for plan in failed_stripes
             if int(plan.get('original_role', -1)) == int(StripeRole.SOURCE)
             and active_by_stripe.get(int(plan['stripe_id']), True)
         )
         if _dbg:
             logger.debug(
                 "Concord recovery: %s — stored %d SOURCE blocks (expected %d)",
-                layer_name, n_stored, expected_stored,
+                layer_name,
+                n_stored,
+                expected_stored,
             )
         if n_stored != expected_stored:
             raise RuntimeError(
@@ -8844,8 +9030,17 @@ def _recover_one_layer_network(
 ) -> Tuple[Optional[torch.Tensor], Dict[str, float]]:
     """Run stripe-level RS decode recovery for one layer via C++ batch pipeline."""
     return _submit_recovery_network(
-        native, manager, layer_name, layer_idx, layer_block_size, layer_total_bytes,
-        n, rank, preloaded_blocks, buf_pool, recovery_role=recovery_role,
+        native,
+        manager,
+        layer_name,
+        layer_idx,
+        layer_block_size,
+        layer_total_bytes,
+        n,
+        rank,
+        preloaded_blocks,
+        buf_pool,
+        recovery_role=recovery_role,
     )
 
 
@@ -8853,9 +9048,11 @@ def _recover_one_layer_network(
 # Training exit teardown: explicit stop after eval, not in __del__
 # ---------------------------------------------------------------------------
 
+
 def _teardown_concord_after_training() -> None:
     """Synchronized Concord teardown at end of training/eval."""
     from megatron.training import get_args
+
     args = get_args()
     if not getattr(args, "use_concord", False):
         return
@@ -8893,6 +9090,7 @@ def _teardown_concord_after_training() -> None:
 # Load teardown: explicit cleanup after recovery only
 # ---------------------------------------------------------------------------
 
+
 def _teardown_concord_native_after_load() -> None:
     """Stop and release native module after load/recovery (not used on save path)."""
     _wait_previous_async_writers(debug=_concord_debug_enabled())
@@ -8907,13 +9105,13 @@ def _teardown_concord_native_after_load() -> None:
     concord_drain_recovery_parity("load_teardown", allow_start_pending=True)
     try:
         from megatron.training import get_args
+
         args = get_args()
     except Exception:
         args = None
 
     inprocess_reuse = bool(
-        args is not None
-        and getattr(args, "ft_inprocess_recovery_benchmark", False)
+        args is not None and getattr(args, "ft_inprocess_recovery_benchmark", False)
     )
     if inprocess_reuse:
         _flush_recovery_async_parity("load_teardown_inprocess_reuse", role)
@@ -8926,21 +9124,14 @@ def _teardown_concord_native_after_load() -> None:
             )
         return
 
-    defer_teardown = bool(
-        args is not None
-        and getattr(args, "concord_defer_load_teardown", False)
-    )
+    defer_teardown = bool(args is not None and getattr(args, "concord_defer_load_teardown", False))
     if defer_teardown:
         _concord_recovery_profile(role, "teardown_deferred")
         if _concord_debug_enabled():
-            logger.debug(
-                "Concord legacy load: deferred native teardown after load (rank %d)",
-                rank,
-            )
+            logger.debug("Concord legacy load: deferred native teardown after load (rank %d)", rank)
         return
     skip_barrier = bool(
-        args is not None
-        and getattr(args, "concord_skip_load_teardown_barrier", False)
+        args is not None and getattr(args, "concord_skip_load_teardown_barrier", False)
     )
     _flush_recovery_async_parity("load_teardown", role)
     _concord_recovery_profile(role, "teardown_start", sync=not skip_barrier)
@@ -8948,8 +9139,7 @@ def _teardown_concord_native_after_load() -> None:
     if _concord_debug_enabled():
         logger.debug("Concord legacy load: cleaning up native module (rank %d)", rank)
     recovery_only = bool(
-        args is not None
-        and getattr(args, "concord_recovery_only_teardown", False)
+        args is not None and getattr(args, "concord_recovery_only_teardown", False)
     )
     if recovery_only and hasattr(manager, "cleanup_recovery"):
         manager.cleanup_recovery(teardown=True, sync=not skip_barrier)
@@ -8958,22 +9148,22 @@ def _teardown_concord_native_after_load() -> None:
     teardown_s = time.time() - t_cleanup
     try:
         from megatron.training.global_vars import add_recovery_teardown_time
+
         add_recovery_teardown_time(teardown_s)
     except Exception:
         pass
-    _concord_recovery_profile(
-        role, "teardown_done", elapsed_s=teardown_s,
-        sync=not skip_barrier,
-    )
+    _concord_recovery_profile(role, "teardown_done", elapsed_s=teardown_s, sync=not skip_barrier)
 
 
 # ---------------------------------------------------------------------------
 # Main recovery entry point
 # ---------------------------------------------------------------------------
 
+
 def _concord_inprocess_workspace_enabled() -> bool:
     try:
         from megatron.training import get_args
+
         args = get_args()
         return bool(
             getattr(args, "ft_inprocess_recovery_benchmark", False)
@@ -9010,24 +9200,36 @@ def _concord_inprocess_workspace_key(
     checkpoint_dir: Path, manager: ConcordManager, failed_global_ranks: List[int]
 ) -> Tuple[Any, ...]:
     from megatron.training import get_args
+
     args = get_args()
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     table_path = Path(manager.get_resolved_table_path()).resolve()
     table_stat = table_path.stat()
     env_names = (
-        "CONCORD_RDMA_LANES_PER_PEER", "CONCORD_RDMA_SEND_LANES_PER_PEER",
-        "CONCORD_RDMA_RECV_LANES_PER_PEER", "CONCORD_INTERFACE",
-        "CONCORD_BASE_IP", "CONCORD_BASE_PORT", "MASTER_ADDR", "MASTER_PORT",
-        "CONCORD_RECOVERY_CONCURRENCY", "CONCORD_RECOVERY_SKIP_PADDING",
+        "CONCORD_RDMA_LANES_PER_PEER",
+        "CONCORD_RDMA_SEND_LANES_PER_PEER",
+        "CONCORD_RDMA_RECV_LANES_PER_PEER",
+        "CONCORD_INTERFACE",
+        "CONCORD_BASE_IP",
+        "CONCORD_BASE_PORT",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "CONCORD_RECOVERY_CONCURRENCY",
+        "CONCORD_RECOVERY_SKIP_PADDING",
     )
     return (
         str(checkpoint_dir.resolve()),
         _concord_checkpoint_file_signature(checkpoint_dir, failed_global_ranks),
         (str(table_path), int(table_stat.st_size), int(table_stat.st_mtime_ns)),
-        rank, world_size, int(manager.group_id), int(manager.rank_in_group),
-        tuple(manager.group_member_ranks or ()), tuple(sorted(int(r) for r in failed_global_ranks)),
-        int(manager.concord_n), int(manager.num_stripes),
+        rank,
+        world_size,
+        int(manager.group_id),
+        int(manager.rank_in_group),
+        tuple(manager.group_member_ranks or ()),
+        tuple(sorted(int(r) for r in failed_global_ranks)),
+        int(manager.concord_n),
+        int(manager.num_stripes),
         bool(getattr(args, "concord_async_recovery_forward", False)),
         bool(_concord_recovery_parity_repair_enabled()),
         bool(_concord_recovery_async_parity_enabled()),
@@ -9040,9 +9242,7 @@ def _prepare_concord_inprocess_workspace_reset(role: str) -> float:
     start = time.time()
     service = _get_active_concord_recovery_service()
     service.wait_all(reason="inprocess_workspace_reset")
-    concord_drain_recovery_parity(
-        "inprocess_workspace_reset", allow_start_pending=True
-    )
+    concord_drain_recovery_parity("inprocess_workspace_reset", allow_start_pending=True)
     if _pending_optimizer_state is not None or _pending_optimizer_container is not None:
         raise RuntimeError(
             "Concord cannot reset the in-process recovery workspace while optimizer "
@@ -9058,14 +9258,17 @@ def _log_concord_inprocess_setup_timing(cache_status: str, values: Dict[str, flo
         logger.info(
             "Concord in-process recovery setup (MAX): cache=%s metadata_plan_s=%.6fs "
             "disk_preload_s=%.6fs alloc_touch_register_s=%.6fs reset_s=%.6fs total_s=%.6fs",
-            cache_status, maxima["metadata_plan_s"], maxima["disk_preload_s"],
-            maxima["alloc_touch_register_s"], maxima["reset_s"], maxima["total_s"],
+            cache_status,
+            maxima["metadata_plan_s"],
+            maxima["disk_preload_s"],
+            maxima["alloc_touch_register_s"],
+            maxima["reset_s"],
+            maxima["total_s"],
         )
 
 
 def recover_concord_legacy_hardware(
-    checkpoint_name: str,
-    failed_global_ranks: List[int],
+    checkpoint_name: str, failed_global_ranks: List[int]
 ) -> Tuple[Dict[str, Any], Dict[str, float]]:
     """Main entry point for Concord hardware recovery.
 
@@ -9101,11 +9304,17 @@ def recover_concord_legacy_hardware(
     n = native.n()
     rg = manager.rank_in_group
     gdr = True
+    my_node = int(manager.rank_in_group) + 1
 
     if _dbg:
         logger.debug(
             "Concord hardware recovery: rank=%d group=%d rig=%d n=%d gdr=%s failed=%s",
-            rank, manager.group_id, rg, n, gdr, failed_global_ranks,
+            rank,
+            manager.group_id,
+            rg,
+            n,
+            gdr,
+            failed_global_ranks,
         )
 
     is_failed = rank in failed_global_ranks
@@ -9116,8 +9325,11 @@ def recover_concord_legacy_hardware(
     workspace = None
     setup_start = time.time()
     setup_timing = {
-        "metadata_plan_s": 0.0, "disk_preload_s": 0.0,
-        "alloc_touch_register_s": 0.0, "reset_s": 0.0, "total_s": 0.0,
+        "metadata_plan_s": 0.0,
+        "disk_preload_s": 0.0,
+        "alloc_touch_register_s": 0.0,
+        "reset_s": 0.0,
+        "total_s": 0.0,
     }
     if workspace_enabled:
         setup_timing["reset_s"] = _prepare_concord_inprocess_workspace_reset(
@@ -9133,11 +9345,13 @@ def recover_concord_legacy_hardware(
         manager.init_concord_hardware_recovery(failed_global_ranks)
     else:
         manager.activate_cached_recovery_plans(
-            failed_global_ranks, workspace["recovery_stripe_plans"],
+            failed_global_ranks,
+            workspace["recovery_stripe_plans"],
             workspace["recovery_dual_failure"],
         )
     failed_group_ranks = [
-        member for member in (manager.group_member_ranks or [])
+        member
+        for member in (manager.group_member_ranks or [])
         if member in set(failed_global_ranks)
     ]
 
@@ -9146,10 +9360,10 @@ def recover_concord_legacy_hardware(
     t_main = time.time()
     if workspace is None:
         main_payload = _load_concord_main_payload(
-            checkpoint_dir, rank, world_size, load_tensor_buffer=False,
+            checkpoint_dir, rank, world_size, load_tensor_buffer=False
         )
         all_tensor_infos, all_layer_order, all_layer_metadata = _concord_metadata_from_payload(
-            main_payload, rank if is_failed else None,
+            main_payload, rank if is_failed else None
         )
     else:
         main_payload = copy.copy(workspace["main_payload"])
@@ -9213,14 +9427,9 @@ def recover_concord_legacy_hardware(
     else:
         all_concord_dirs = workspace["all_concord_dirs"]
     involved = is_failed or bool(manager.recovery_stripe_plans)
-    my_node = manager.rank_in_group + 1
-    data_recovery_plans = [
-        p for p in manager.recovery_stripe_plans
-        if _is_data_recovery_plan(p, n)
-    ]
+    data_recovery_plans = [p for p in manager.recovery_stripe_plans if _is_data_recovery_plan(p, n)]
     parity_recovery_plans = [
-        p for p in manager.recovery_stripe_plans
-        if _is_parity_recovery_plan(p, n)
+        p for p in manager.recovery_stripe_plans if _is_parity_recovery_plan(p, n)
     ]
     setup_timing["metadata_plan_s"] = time.time() - metadata_plan_start
 
@@ -9228,7 +9437,8 @@ def recover_concord_legacy_hardware(
         logger.debug(
             "Concord recovery: critical SOURCE recovery critical_stripes=%d "
             "deferred_parity_stripes=%d",
-            len(data_recovery_plans), len(parity_recovery_plans),
+            len(data_recovery_plans),
+            len(parity_recovery_plans),
         )
     failed_by_group: Dict[int, int] = {}
     for failed_rank in failed_global_ranks:
@@ -9241,40 +9451,51 @@ def recover_concord_legacy_hardware(
                 int(target.get('original_role', -1)) == int(StripeRole.SOURCE)
                 for target in plan.get('failed_targets', [])
             )
-            for plan in data_recovery_plans if plan.get('dual_failure')
+            for plan in data_recovery_plans
+            if plan.get('dual_failure')
         )
         deferred_targets = sum(
             sum(
-                int(target.get('original_role', -1)) in (
-                    int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET)
-                )
+                int(target.get('original_role', -1))
+                in (int(StripeRole.ENCODER), int(StripeRole.PARITY_TARGET))
                 for target in plan.get('failed_targets', [])
             )
-            for plan in parity_recovery_plans if plan.get('dual_failure')
+            for plan in parity_recovery_plans
+            if plan.get('dual_failure')
         )
         logger.info(
             "Concord HW2 recovery: failed_ranks=%s dual_groups=%d "
             "local_critical_stripes=%d local_deferred_parity_stripes=%d "
             "local_critical_targets=%d local_deferred_parity_targets=%d "
             "group_synchronized_layers=%d",
-            failed_global_ranks, dual_group_count, len(data_recovery_plans),
-            len(parity_recovery_plans), critical_targets, deferred_targets,
+            failed_global_ranks,
+            dual_group_count,
+            len(data_recovery_plans),
+            len(parity_recovery_plans),
+            critical_targets,
+            deferred_targets,
             n_encode_iters,
         )
 
     t_disk = time.time()
-    preloaded: Dict[int, Dict[int, torch.Tensor]] = {
-        i: {} for i in range(n_encode_iters)
-    }
+    preloaded: Dict[int, Dict[int, torch.Tensor]] = {i: {} for i in range(n_encode_iters)}
     full_buf = None
     if workspace is not None:
         full_buf = workspace["full_buf"]
         preloaded = workspace["preloaded"]
     elif is_survivor:
         full_buf, preloaded = _prep_survivor_hw_disk(
-            manager, checkpoint_dir, rank, main_payload, n_encode_iters,
-            all_layer_order, all_layer_metadata, data_recovery_plans,
-            saved_block_size, my_node, all_concord_dirs,
+            manager,
+            checkpoint_dir,
+            rank,
+            main_payload,
+            n_encode_iters,
+            all_layer_order,
+            all_layer_metadata,
+            data_recovery_plans,
+            saved_block_size,
+            my_node,
+            all_concord_dirs,
             preload_recovery=bool(data_recovery_plans),
         )
         for blocks in preloaded.values():
@@ -9285,15 +9506,10 @@ def recover_concord_legacy_hardware(
     setup_timing["disk_preload_s"] = timings['disk_io']
 
     if is_survivor and not involved and _dbg:
-        logger.debug(
-            "Concord recovery: rank %d not involved in recovery, local load only",
-            rank,
-        )
+        logger.debug("Concord recovery: rank %d not involved in recovery, local load only", rank)
 
     max_block_size = max(
-        _max_layer_block_size(
-            member, all_layer_order, all_layer_metadata, saved_block_size,
-        )
+        _max_layer_block_size(member, all_layer_order, all_layer_metadata, saved_block_size)
         for member in group_members
     )
     role_plans_for_buffers = (
@@ -9301,23 +9517,26 @@ def recover_concord_legacy_hardware(
         if _concord_recovery_parity_repair_enabled()
         else data_recovery_plans
     )
-    is_decoder = any(
-        my_node == p['decoder_node'] for p in role_plans_for_buffers
-    )
-    is_helper = any(
-        my_node in p['helper_nodes'] for p in role_plans_for_buffers
-    )
+    is_decoder = any(my_node == p['decoder_node'] for p in role_plans_for_buffers)
+    is_helper = any(my_node in p['helper_nodes'] for p in role_plans_for_buffers)
     recovery_role = _concord_recovery_role(is_failed, is_decoder, is_helper, involved)
     setattr(manager, "_concord_recovery_role", recovery_role)
     _get_active_concord_recovery_service().reset_for_load(recovery_role)
     _concord_recovery_profile(
-        recovery_role, "rank_role", is_failed=is_failed, is_decoder=is_decoder,
-        is_helper=is_helper, involved=involved, critical_stripes=len(data_recovery_plans),
-        deferred_parity_stripes=len(parity_recovery_plans), encode_iters=n_encode_iters,
+        recovery_role,
+        "rank_role",
+        is_failed=is_failed,
+        is_decoder=is_decoder,
+        is_helper=is_helper,
+        involved=involved,
+        critical_stripes=len(data_recovery_plans),
+        deferred_parity_stripes=len(parity_recovery_plans),
+        encode_iters=n_encode_iters,
         disk_io_s=timings['disk_io'],
     )
     try:
         from megatron.training.global_vars import update_recovery_to_forward_timer_context
+
         update_recovery_to_forward_timer_context(role=recovery_role)
     except Exception:
         pass
@@ -9331,6 +9550,7 @@ def recover_concord_legacy_hardware(
     async_detach_safe = False
     try:
         from megatron.training import get_args
+
         args = get_args()
         async_forward = bool(getattr(args, "concord_async_recovery_forward", False))
         async_detach_safe = True
@@ -9340,8 +9560,15 @@ def recover_concord_legacy_hardware(
     runtime_for_recovery: Optional[_ConcordLayerwiseRuntime] = None
     if async_forward and is_failed:
         pending_records = _make_pending_layerwise_records(
-            rank, is_failed, main_payload, all_layer_order, all_layer_metadata,
-            all_concord_dirs, checkpoint_dir, saved_block_size, n_encode_iters,
+            rank,
+            is_failed,
+            main_payload,
+            all_layer_order,
+            all_layer_metadata,
+            all_concord_dirs,
+            checkpoint_dir,
+            saved_block_size,
+            n_encode_iters,
             recovery_rank=rank,
         )
         runtime_for_recovery = _ConcordLayerwiseRuntime(pending_records)
@@ -9361,8 +9588,15 @@ def recover_concord_legacy_hardware(
             if not involved:
                 continue
             job = _make_layer_recovery_job(
-                encode_iter, rank, is_failed, main_payload, all_layer_order,
-                all_layer_metadata, all_concord_dirs, checkpoint_dir, saved_block_size,
+                encode_iter,
+                rank,
+                is_failed,
+                main_payload,
+                all_layer_order,
+                all_layer_metadata,
+                all_concord_dirs,
+                checkpoint_dir,
+                saved_block_size,
                 recovery_rank=rank,
                 failed_group_ranks=failed_group_ranks,
                 group_members=manager.group_member_ranks or [rank],
@@ -9370,9 +9604,7 @@ def recover_concord_legacy_hardware(
             if job is not None:
                 recovery_jobs.append(job)
     common_wave_size = _recovery_common_wave_size(n)
-    _validate_recovery_alignment(
-        recovery_jobs, manager.recovery_stripe_plans, n, common_wave_size,
-    )
+    _validate_recovery_alignment(recovery_jobs, manager.recovery_stripe_plans, n, common_wave_size)
     if _dbg:
         logger.debug(
             "Concord recovery job order rank=%d role=%s: %s",
@@ -9386,7 +9618,12 @@ def recover_concord_legacy_hardware(
         buf_pool = workspace["buf_pool"]
     else:
         buf_pool = _allocate_recovery_buf_pool(
-            native, n, max_block_size, is_failed, is_decoder, is_helper,
+            native,
+            n,
+            max_block_size,
+            is_failed,
+            is_decoder,
+            is_helper,
             dual_failure=getattr(manager, 'recovery_dual_failure', False),
             concurrency_override=common_wave_size,
         )
@@ -9394,8 +9631,11 @@ def recover_concord_legacy_hardware(
     # Recovery network ordering is an encode_iter protocol invariant. The detached
     # worker therefore owns the complete ordered job sequence without splitting it.
     detached_transformer_recovery = bool(
-        async_forward and async_detach_safe and is_failed
-        and runtime_for_recovery is not None and recovery_jobs
+        async_forward
+        and async_detach_safe
+        and is_failed
+        and runtime_for_recovery is not None
+        and recovery_jobs
         and direct_tensor_views_by_key is not None
     )
     common_readiness: Optional[_ConcordCommonReadiness] = None
@@ -9407,9 +9647,8 @@ def recover_concord_legacy_hardware(
             for info in main_payload.get("tensor_infos", [])
             if getattr(info, "key", "")
             and getattr(info, "key", "") not in distributed_common_keys
-            and _classify_concord_tensor(
-                getattr(info, "key", ""), optimizer_layer_map
-            ).kind not in ("model_layer", "optimizer_layer")
+            and _classify_concord_tensor(getattr(info, "key", ""), optimizer_layer_map).kind
+            not in ("model_layer", "optimizer_layer")
             and int(getattr(info, "size_bytes", 0)) > 0
         }
         common_readiness = _ConcordCommonReadiness(required_common_keys)
@@ -9417,8 +9656,10 @@ def recover_concord_legacy_hardware(
         if workspace is None:
             _preallocate_stable_failed_layer_bufs(native, buf_pool, recovery_jobs, n)
         _concord_recovery_profile(
-            recovery_role, "stable_failed_layer_bufs_enabled",
-            jobs=len(recovery_jobs), direct_reconstruct=True,
+            recovery_role,
+            "stable_failed_layer_bufs_enabled",
+            jobs=len(recovery_jobs),
+            direct_reconstruct=True,
         )
 
     parity_preloaded: Dict[int, Dict[int, torch.Tensor]] = {}
@@ -9427,8 +9668,13 @@ def recover_concord_legacy_hardware(
             parity_preloaded = workspace["parity_preloaded"]
         else:
             parity_preloaded = _preload_recovery_stripe_blocks(
-                n_encode_iters, all_layer_order, all_layer_metadata,
-                parity_recovery_plans, rank, my_node, saved_block_size,
+                n_encode_iters,
+                all_layer_order,
+                all_layer_metadata,
+                parity_recovery_plans,
+                rank,
+                my_node,
+                saved_block_size,
                 all_concord_dirs,
             )
             for blocks in parity_preloaded.values():
@@ -9436,8 +9682,13 @@ def recover_concord_legacy_hardware(
                     if blk.numel() > 1:
                         native.register_recovery_buffer(blk.data_ptr(), blk.numel())
         _set_pending_recovery_parity_repair(
-            recovery_jobs, buf_pool, checkpoint_dir, rank,
-            all_layer_metadata, recovery_role, parity_preloaded=parity_preloaded
+            recovery_jobs,
+            buf_pool,
+            checkpoint_dir,
+            rank,
+            all_layer_metadata,
+            recovery_role,
+            parity_preloaded=parity_preloaded,
         )
     if recovery_jobs and _concord_recovery_parity_repair_enabled():
         _concord_recovery_profile(
@@ -9477,9 +9728,7 @@ def recover_concord_legacy_hardware(
         manager.set_inprocess_recovery_workspace(workspace_key, workspace)
     setup_timing["total_s"] = time.time() - setup_start
     if workspace_enabled:
-        _log_concord_inprocess_setup_timing(
-            "hit" if cache_hit else "miss", setup_timing,
-        )
+        _log_concord_inprocess_setup_timing("hit" if cache_hit else "miss", setup_timing)
 
     timings['prep'] = time.time() - t_prep
 
@@ -9487,8 +9736,7 @@ def recover_concord_legacy_hardware(
         torch.distributed.barrier()
 
     first_recovery_layer_idx = min(
-        (job.layer_idx for job in recovery_jobs if job.layer_idx >= 0),
-        default=None,
+        (job.layer_idx for job in recovery_jobs if job.layer_idx >= 0), default=None
     )
     t_net = time.time()
     _start_concord_first_layer_recovery_timer(first_recovery_layer_idx)
@@ -9502,9 +9750,9 @@ def recover_concord_legacy_hardware(
         recovery_to_forward_started = True
         try:
             from megatron.training.global_vars import start_recovery_to_forward_timer
+
             start_recovery_to_forward_timer(
-                "Concord", "recovery_pipeline_start",
-                role=recovery_role, rank0_only_max=True,
+                "Concord", "recovery_pipeline_start", role=recovery_role, rank0_only_max=True
             )
             _arm_concord_first_layer_cuda_timer()
         except Exception:
@@ -9520,19 +9768,20 @@ def recover_concord_legacy_hardware(
             for _record, item in layer_results
         )
         timings['network_wait'] += sum(
-            item.get('network_wait_s', item.get('wait_s', 0.0))
-            for _record, item in layer_results
+            item.get('network_wait_s', item.get('wait_s', 0.0)) for _record, item in layer_results
         )
         timings['materialize'] += sum(
             item.get('materialize_s', 0.0) for _record, item in layer_results
         )
         timings['pipeline_overlap'] = max(
             timings['pipeline_overlap'],
-            max((item.get('pipeline_overlap_s', 0.0) for _record, item in layer_results), default=0.0),
+            max(
+                (item.get('pipeline_overlap_s', 0.0) for _record, item in layer_results),
+                default=0.0,
+            ),
         )
         timings['pipeline_critical'] += max(
-            (item.get('pipeline_critical_s', 0.0) for _record, item in layer_results),
-            default=0.0,
+            (item.get('pipeline_critical_s', 0.0) for _record, item in layer_results), default=0.0
         )
 
     if _dbg:
@@ -9540,15 +9789,29 @@ def recover_concord_legacy_hardware(
             "Concord recovery async decision: rank=%d async_forward=%s "
             "async_detach_safe=%s is_failed=%s involved=%s jobs=%d "
             "runtime=%s detached=%s",
-            rank, async_forward, async_detach_safe, is_failed, involved,
-            len(recovery_jobs), runtime_for_recovery is not None,
+            rank,
+            async_forward,
+            async_detach_safe,
+            is_failed,
+            involved,
+            len(recovery_jobs),
+            runtime_for_recovery is not None,
             detached_transformer_recovery,
         )
     if detached_transformer_recovery:
         _start_recovery_to_forward_from_pipeline_start()
         recovery_worker = _start_layer_recovery_worker(
-            recovery_jobs, manager, native, n, rank, is_failed, preloaded,
-            buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
+            recovery_jobs,
+            manager,
+            native,
+            n,
+            rank,
+            is_failed,
+            preloaded,
+            buf_pool,
+            full_buf,
+            global_tensor_infos,
+            runtime_for_recovery,
             cleanup_after=False,
             map_to_full_buf=async_map_to_full_buf,
             clone_runtime_tensors=async_clone_runtime_tensors,
@@ -9564,13 +9827,24 @@ def recover_concord_legacy_hardware(
             logger.debug(
                 "Concord recovery: detached ordered worker started rank=%d jobs=%d "
                 "required_common=%d",
-                rank, len(recovery_jobs), len(common_readiness.required_keys),
+                rank,
+                len(recovery_jobs),
+                len(common_readiness.required_keys),
             )
     elif async_forward and involved and recovery_jobs:
         _start_recovery_to_forward_from_pipeline_start()
         recovery_worker = _start_layer_recovery_worker(
-            recovery_jobs, manager, native, n, rank, is_failed, preloaded,
-            buf_pool, full_buf, global_tensor_infos, runtime_for_recovery,
+            recovery_jobs,
+            manager,
+            native,
+            n,
+            rank,
+            is_failed,
+            preloaded,
+            buf_pool,
+            full_buf,
+            global_tensor_infos,
+            runtime_for_recovery,
             cleanup_after=False,
             map_to_full_buf=sync_map_to_full_buf,
             clone_runtime_tensors=sync_clone_runtime_tensors,
@@ -9584,19 +9858,29 @@ def recover_concord_legacy_hardware(
         if _dbg:
             logger.debug(
                 "Concord recovery: async-forward worker started rank=%d jobs=%d",
-                rank, len(recovery_jobs),
+                rank,
+                len(recovery_jobs),
             )
         safe_point = getattr(args, "concord_recovery_safe_point", "load")
         if _dbg:
             logger.debug(
                 "Concord recovery: deferring async worker join to safe_point=%s rank=%d",
-                safe_point, rank,
+                safe_point,
+                rank,
             )
     else:
         _start_recovery_to_forward_from_pipeline_start()
         sync_results = _run_recovery_pipeline(
-            recovery_jobs, manager, native, n, rank, is_failed, preloaded,
-            buf_pool, full_buf, global_tensor_infos,
+            recovery_jobs,
+            manager,
+            native,
+            n,
+            rank,
+            is_failed,
+            preloaded,
+            buf_pool,
+            full_buf,
+            global_tensor_infos,
             runtime=runtime_for_recovery,
             map_to_full_buf=sync_map_to_full_buf,
             clone_runtime_tensors=sync_clone_runtime_tensors,
@@ -9629,11 +9913,11 @@ def recover_concord_legacy_hardware(
         if detached_transformer_recovery:
             common_snapshot = common_readiness.wait_snapshot()
             result = _reconstruct_common_from_tensor_views(
-                main_payload, common_snapshot, flat_key_roots,
+                main_payload, common_snapshot, flat_key_roots
             )
         elif direct_tensor_views_by_key is not None:
             result = _reconstruct_from_tensor_views(
-                main_payload, direct_tensor_views_by_key, flat_key_roots,
+                main_payload, direct_tensor_views_by_key, flat_key_roots
             )
         else:
             result = _reconstruct_from_main_payload(main_payload, flat_key_roots)
@@ -9641,14 +9925,18 @@ def recover_concord_legacy_hardware(
         logger.exception(
             "Concord recovery: state_dict rebuild failed rank=%d role=%s "
             "detached=%s direct_views=%s full_buf=%s",
-            rank, recovery_role, detached_transformer_recovery,
-            direct_tensor_views_by_key is not None, full_buf is not None,
+            rank,
+            recovery_role,
+            detached_transformer_recovery,
+            direct_tensor_views_by_key is not None,
+            full_buf is not None,
         )
         raise
     if is_failed and (layerwise_records or runtime_for_recovery is not None):
         records_to_export = (
             list(runtime_for_recovery._records_by_layer.values())
-            if runtime_for_recovery is not None else layerwise_records
+            if runtime_for_recovery is not None
+            else layerwise_records
         )
         result["__concord_layerwise_runtime__"] = {
             "rank": rank,
@@ -9677,8 +9965,7 @@ def recover_concord_legacy_hardware(
         }
         if _dbg:
             logger.debug(
-                "Concord recovery: layerwise runtime exported layers=%d "
-                "materialize_total=%.4fs",
+                "Concord recovery: layerwise runtime exported layers=%d " "materialize_total=%.4fs",
                 len(records_to_export),
                 sum(r.materialize_s for r in records_to_export),
             )
@@ -9690,13 +9977,16 @@ def recover_concord_legacy_hardware(
         _teardown_concord_native_after_load()
     elif safe_point != "load" or parity_pending:
         _concord_recovery_profile(
-            recovery_role, "teardown_moved_to_safe_point",
+            recovery_role,
+            "teardown_moved_to_safe_point",
             safe_point=("after_forward_backward" if parity_pending else safe_point),
         )
     return result, timings
 
 
-def _reconstruct_from_main_payload(main_payload: Dict, flat_key_roots: list = None) -> Dict[str, Any]:
+def _reconstruct_from_main_payload(
+    main_payload: Dict, flat_key_roots: list = None
+) -> Dict[str, Any]:
     """Reconstruct state_dict from metadata + assembled tensor_buffer."""
     tensor_infos = main_payload.get("tensor_infos", [])
     non_tensor_data = main_payload.get("non_tensor_data", {})
@@ -9721,14 +10011,13 @@ def _reconstruct_from_main_payload(main_payload: Dict, flat_key_roots: list = No
     from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
         unflatten_optimizer_fp32_params,
     )
+
     unflatten_optimizer_fp32_params(result)
     return result
 
 
 def _reconstruct_from_tensor_views(
-    main_payload: Dict,
-    tensor_views_by_key: Dict[str, torch.Tensor],
-    flat_key_roots: list = None,
+    main_payload: Dict, tensor_views_by_key: Dict[str, torch.Tensor], flat_key_roots: list = None
 ) -> Dict[str, Any]:
     """Reconstruct state_dict from recovered per-layer tensor views."""
     tensor_infos = main_payload.get("tensor_infos", [])
@@ -9768,6 +10057,7 @@ def _reconstruct_from_tensor_views(
     from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
         unflatten_optimizer_fp32_params,
     )
+
     unflatten_optimizer_fp32_params(result)
     return result
 
@@ -9786,7 +10076,9 @@ def _infer_distributed_common_keys_from_metadata(main_payload: Dict) -> set:
             # never be inferred as deferred merely because its name starts with layer_.
             if re.fullmatch(r"layer_\d+", str(layer_name)) is None:
                 continue
-            tensor_infos = layer_meta.get("tensor_infos", []) if isinstance(layer_meta, dict) else []
+            tensor_infos = (
+                layer_meta.get("tensor_infos", []) if isinstance(layer_meta, dict) else []
+            )
             for info in tensor_infos:
                 key = getattr(info, "key", "")
                 if not key:
@@ -9805,9 +10097,7 @@ def _distributed_common_keys_for_payload(main_payload: Dict) -> set:
 
 
 def _reconstruct_common_from_tensor_views(
-    main_payload: Dict,
-    tensor_views_by_key: Dict[str, torch.Tensor],
-    flat_key_roots: list = None,
+    main_payload: Dict, tensor_views_by_key: Dict[str, torch.Tensor], flat_key_roots: list = None
 ) -> Dict[str, Any]:
     """Reconstruct common state; layer tensors are injected by runtime."""
     tensor_infos = main_payload.get("tensor_infos", [])
@@ -9871,18 +10161,22 @@ def _reconstruct_common_from_tensor_views(
             "Concord recovery: reconstructed common tensor views "
             "count=%d skipped_layer_tensors=%d bytes=%d "
             "deferred_distributed_common=%d deferred_bytes=%d",
-            len(common_infos), skipped, skipped_bytes, deferred, deferred_bytes,
+            len(common_infos),
+            skipped,
+            skipped_bytes,
+            deferred,
+            deferred_bytes,
         )
     return result
-
 
 
 # ---------------------------------------------------------------------------
 # Load from local SOURCE CNBK blocks (metadata-only main)
 # ---------------------------------------------------------------------------
 
+
 def _compile_stripe_plans_for_load(
-    poa_path: str, rank_in_group: int, k: int, m: int,
+    poa_path: str, rank_in_group: int, k: int, m: int
 ) -> List[StripePlan]:
     """Lightweight POA compile for load (no RDMA init)."""
     import glob
@@ -9953,7 +10247,7 @@ def _build_full_buf_from_local_blocks(
     global_tensor_infos = main_payload.get("tensor_infos", [])
 
     stripe_plans = _compile_stripe_plans_for_load(
-        poa_path, rank_in_group, int(main_payload["k"]), int(main_payload["m"]),
+        poa_path, rank_in_group, int(main_payload["k"]), int(main_payload["m"])
     )
     source_stripes = _enumerate_source_stripes(stripe_plans)
     num_source = len(source_stripes)
@@ -9961,7 +10255,9 @@ def _build_full_buf_from_local_blocks(
     if _concord_debug_enabled():
         logger.debug(
             "Concord load: rank=%d assembling from %d SOURCE stripes, layers=%d",
-            rank, num_source, len(layer_names),
+            rank,
+            num_source,
+            len(layer_names),
         )
 
     if timings is not None:
@@ -10000,18 +10296,14 @@ def _build_full_buf_from_local_blocks(
     cache_keys = cache_source_keys if cache_source_keys is not None else set()
     use_staged_blocks = bool(cache_keys)
     global_info_by_key = {
-        getattr(info, "key", ""): info
-        for info in global_tensor_infos
-        if getattr(info, "key", "")
+        getattr(info, "key", ""): info for info in global_tensor_infos if getattr(info, "key", "")
     }
 
     for layer_name in layer_names:
         layer_dir = checkpoint_dir / layer_name
         layer_main_path = layer_dir / f"concord_layer_main_rank{rank}.pt"
         if not layer_main_path.is_file():
-            raise RuntimeError(
-                f"Concord load: missing layer metadata file {layer_main_path}"
-            )
+            raise RuntimeError(f"Concord load: missing layer metadata file {layer_main_path}")
 
         t_meta = time.time()
         layer_meta = torch.load(layer_main_path, map_location="cpu", weights_only=False)
@@ -10020,15 +10312,11 @@ def _build_full_buf_from_local_blocks(
             timings["layer_meta"] += time.time() - t_meta
         layer_block_size = int(layer_meta.get("block_size", 0))
         if layer_block_size <= 0:
-            raise RuntimeError(
-                f"Concord load: invalid block_size for layer {layer_name}"
-            )
+            raise RuntimeError(f"Concord load: invalid block_size for layer {layer_name}")
         layer_infos = layer_meta.get("tensor_infos", [])
         actual_tensor_size = int(layer_meta.get("actual_tensor_size", 0))
         n_filled_blocks = _n_filled_blocks_for_layer(
-            actual_tensor_size,
-            layer_block_size,
-            num_source,
+            actual_tensor_size, layer_block_size, num_source
         )
 
         if use_staged_blocks:
@@ -10036,19 +10324,15 @@ def _build_full_buf_from_local_blocks(
             for stripe_id, blk_idx in source_stripes:
                 if blk_idx >= n_filled_blocks:
                     continue
-                block_path = (
-                    layer_dir / f"stripe_{stripe_id}" / f"concord_shard_rank{rank}.pt"
-                )
+                block_path = layer_dir / f"stripe_{stripe_id}" / f"concord_shard_rank{rank}.pt"
                 src_offset = blk_idx * layer_block_size
-                dst_slice = layer_buf[src_offset:src_offset + layer_block_size]
+                dst_slice = layer_buf[src_offset : src_offset + layer_block_size]
                 t_read = time.time()
                 copy_len = _read_frbk_block_into(dst_slice, str(block_path))
                 if timings is not None:
                     timings["read_blocks"] += time.time() - t_read
                 if copy_len == 0:
-                    logger.warning(
-                        "Concord load: missing block %s, skipping stripe", block_path,
-                    )
+                    logger.warning("Concord load: missing block %s, skipping stripe", block_path)
                     continue
                 if timings is not None:
                     timings["source_blocks"] += 1.0
@@ -10068,8 +10352,8 @@ def _build_full_buf_from_local_blocks(
                 global_offset = int(getattr(global_info, "offset", 0))
                 size = int(getattr(global_info, "size_bytes", 0))
                 if size > 0 and global_offset + size <= full_buf.numel():
-                    full_buf[global_offset:global_offset + size].copy_(
-                        layer_buf[local_offset:local_offset + size]
+                    full_buf[global_offset : global_offset + size].copy_(
+                        layer_buf[local_offset : local_offset + size]
                     )
                     if timings is not None:
                         timings["bytes_copied"] += float(size)
@@ -10103,20 +10387,18 @@ def _build_full_buf_from_local_blocks(
                     break
                 stripe_id, _source_blk_idx = source
                 chunk = min(remaining, layer_block_size - within_block)
-                block_path = (
-                    layer_dir / f"stripe_{stripe_id}" / f"concord_shard_rank{rank}.pt"
-                )
-                dst = full_buf[global_offset:global_offset + chunk]
+                block_path = layer_dir / f"stripe_{stripe_id}" / f"concord_shard_rank{rank}.pt"
+                dst = full_buf[global_offset : global_offset + chunk]
                 t_read = time.time()
-                copy_len = _read_frbk_range_into(
-                    dst, str(block_path), within_block, chunk,
-                )
+                copy_len = _read_frbk_range_into(dst, str(block_path), within_block, chunk)
                 if timings is not None:
                     timings["read_blocks"] += time.time() - t_read
                 if copy_len <= 0:
                     logger.warning(
                         "Concord load: missing range %s offset=%d size=%d",
-                        block_path, within_block, chunk,
+                        block_path,
+                        within_block,
+                        chunk,
                     )
                     break
                 if timings is not None:
@@ -10138,13 +10420,11 @@ def _assemble_state_dict_from_local_blocks(
     """Assemble state_dict from metadata-only main + local SOURCE CNBK shards."""
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-    world_size = (
-        torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    )
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     if main_payload is None:
         main_payload = _load_concord_main_payload(
-            checkpoint_dir, rank, world_size, load_tensor_buffer=False,
+            checkpoint_dir, rank, world_size, load_tensor_buffer=False
         )
 
     main_path = checkpoint_dir / f"concord_main_rank{rank}.pt"
@@ -10156,7 +10436,7 @@ def _assemble_state_dict_from_local_blocks(
     assemble_timings: Dict[str, float] = {}
     t_assemble = time.time()
     full_buf = _build_full_buf_from_local_blocks(
-        checkpoint_dir, rank, main_payload, timings=assemble_timings,
+        checkpoint_dir, rank, main_payload, timings=assemble_timings
     )
     assemble_s = time.time() - t_assemble
 
@@ -10167,9 +10447,11 @@ def _assemble_state_dict_from_local_blocks(
     rebuild_sd_s = time.time() - t_rebuild
     try:
         from megatron.training import get_args
+
         args = get_args()
         if getattr(args, "use_concord", False):
             from megatron.training.global_vars import set_ft_load_timing_context
+
             timings = {
                 "network_encode": 0.0,
                 "assemble": assemble_s,
@@ -10191,6 +10473,7 @@ def _assemble_state_dict_from_local_blocks(
         args = None
         try:
             from megatron.training import get_args
+
             args = get_args()
             safe_point = getattr(args, "concord_recovery_safe_point", "load")
         except Exception:
@@ -10204,9 +10487,7 @@ def _assemble_state_dict_from_local_blocks(
         if inprocess_software_active:
             manager = ConcordManager()
             role = getattr(manager, "_concord_recovery_role", "local_load")
-            _flush_recovery_async_parity(
-                "load_teardown_inprocess_software", role,
-            )
+            _flush_recovery_async_parity("load_teardown_inprocess_software", role)
             manager.end_recovery()
             rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
             if rank == 0:
@@ -10214,15 +10495,14 @@ def _assemble_state_dict_from_local_blocks(
                     "Concord software in-process load: deferring native teardown "
                     "until training exit"
                 )
-            _concord_recovery_profile(
-                role, "teardown_skipped_inprocess_software",
-            )
+            _concord_recovery_profile(role, "teardown_skipped_inprocess_software")
         elif safe_point == "load":
             _teardown_concord_native_after_load()
         else:
             _concord_recovery_profile(
                 getattr(ConcordManager(), "_concord_recovery_role", "local_load"),
-                "teardown_moved_to_safe_point", safe_point=safe_point,
+                "teardown_moved_to_safe_point",
+                safe_point=safe_point,
             )
     return result
 
@@ -10237,6 +10517,7 @@ def load_concord_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     via RDMA RS decode; survivors assemble from local blocks like normal load.
     """
     from megatron.training import get_args
+
     args = get_args()
 
     hw_failure = getattr(args, "use_concord_hardware_failure", False)
@@ -10245,7 +10526,9 @@ def load_concord_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if _concord_debug_enabled():
         logger.debug(
             "Concord load: hw_failure=%s failed_ranks_raw=%r failed_ranks_parsed=%r",
-            hw_failure, failed_ranks_str, failed_ranks_parsed,
+            hw_failure,
+            failed_ranks_str,
+            failed_ranks_parsed,
         )
 
     failed_ranks = failed_ranks_parsed
@@ -10254,13 +10537,12 @@ def load_concord_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     if hw_failure and failed_ranks:
         if _concord_debug_enabled():
-            logger.debug(
-                "Concord: hardware recovery mode — failed ranks %s", failed_ranks
-            )
+            logger.debug("Concord: hardware recovery mode — failed ranks %s", failed_ranks)
         result, _t_fr = recover_concord_legacy_hardware(checkpoint_name, failed_ranks)
         _t_fr['total'] = _t_fr['network_encode'] + _t_fr['rebuild_sd']
         try:
             from megatron.training.global_vars import set_ft_load_timing_context
+
             set_ft_load_timing_context("CONCORD", "HW", _t_fr)
         except Exception:
             pass
@@ -10273,6 +10555,7 @@ def load_concord_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             )
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("concord_load_return")
         except Exception:
             pass

@@ -10,9 +10,9 @@ singleton and its C++ native module.
 import ctypes
 import os
 import queue
-from collections import deque
 import struct
 import time
+from collections import deque
 from logging import getLogger
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -28,12 +28,12 @@ from megatron.core.dist_checkpointing.strategies.state_dict_decomposer import (
     DecomposedStateDict,
     GlobalMetadataRegistry,
     TensorMetadata,
+    assign_tensor_offsets,
     decompose_state_dict_for_save,
     extract_tensors_from_continuous_buffer,
     reconstruct_state_dict,
-    unflatten_optimizer_fp32_params,
-    assign_tensor_offsets,
     tensor_layout_size,
+    unflatten_optimizer_fp32_params,
 )
 
 logger = getLogger(__name__)
@@ -45,14 +45,10 @@ def _eccheck_hw2_recv_ring_depth() -> int:
         depth = int(raw_depth)
     except ValueError as exc:
         raise ValueError(
-            "ECCHECK_HW2_RECV_RING_DEPTH must be an integer in [1, 64], "
-            f"got {raw_depth!r}"
+            "ECCHECK_HW2_RECV_RING_DEPTH must be an integer in [1, 64], " f"got {raw_depth!r}"
         ) from exc
     if depth < 1 or depth > 64:
-        raise ValueError(
-            "ECCHECK_HW2_RECV_RING_DEPTH must be in [1, 64], "
-            f"got {depth}"
-        )
+        raise ValueError("ECCHECK_HW2_RECV_RING_DEPTH must be in [1, 64], " f"got {depth}")
     return depth
 
 
@@ -90,6 +86,7 @@ def _timed_barrier() -> float:
     torch.distributed.barrier()
     return time.time() - start
 
+
 _FORMAT = "eccheck_torch_legacy"
 
 
@@ -105,9 +102,9 @@ def _checkpoint_dir_from_path(checkpoint_name: str) -> Path:
 
 _BUILD_GLOBAL_REGISTRY_CACHE: Dict[tuple, tuple] = {}
 
+
 def _build_global_registry(
-    local_metadata: List[TensorMetadata],
-    local_non_tensor: Dict[str, Any],
+    local_metadata: List[TensorMetadata], local_non_tensor: Dict[str, Any]
 ) -> Tuple[Dict[int, List[TensorMetadata]], Dict[int, Dict[str, Any]]]:
     if not torch.distributed.is_initialized():
         return {0: local_metadata}, {0: local_non_tensor}
@@ -128,9 +125,7 @@ def _build_global_registry(
     return rank_metadata, rank_non_tensor
 
 
-def _tensor_infos_to_local_metadata(
-    rank: int, tensor_infos: List[Any]
-) -> List[TensorMetadata]:
+def _tensor_infos_to_local_metadata(rank: int, tensor_infos: List[Any]) -> List[TensorMetadata]:
     out: List[TensorMetadata] = []
     for info in tensor_infos:
         chunk_type = getattr(info, "chunk_type", "data")
@@ -172,9 +167,7 @@ def _rank_total_bytes(rank_metadata: Dict[int, List[TensorMetadata]], rank: int)
     return tensor_layout_size(rank_metadata.get(rank, []))
 
 
-def _rank_data_transfer_bytes(
-    registry: GlobalMetadataRegistry, rank: int, world_size: int
-) -> int:
+def _rank_data_transfer_bytes(registry: GlobalMetadataRegistry, rank: int, world_size: int) -> int:
     """Return actual data bytes for one rank, without EC padding."""
     if rank < 0 or rank >= world_size:
         return 0
@@ -220,9 +213,7 @@ def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
         key = info.get("key", "") if isinstance(info, dict) else getattr(info, "key", "")
         first_seg = key.split(".")[0]
         if first_seg == "model" or (
-            first_seg.startswith("model")
-            and len(first_seg) > 5
-            and first_seg[5:].isdigit()
+            first_seg.startswith("model") and len(first_seg) > 5 and first_seg[5:].isdigit()
         ):
             flat_key_roots.add(first_seg)
     return flat_key_roots
@@ -231,6 +222,7 @@ def _infer_flat_key_roots(main_payload: Dict[str, Any]) -> Set[str]:
 # ---------------------------------------------------------------------------
 # Block allocation (save + load)
 # ---------------------------------------------------------------------------
+
 
 def _allocate_eccheck_blocks_legacy(
     manager: ECCHECKManager,
@@ -244,17 +236,13 @@ def _allocate_eccheck_blocks_legacy(
         block_names = ["own_buffer", "partner_buffer"]
 
     if world_size > 1:
-        all_sizes = [
-            tensor_layout_size(rank_metadata.get(r, []))
-            for r in range(world_size)
-        ]
+        all_sizes = [tensor_layout_size(rank_metadata.get(r, [])) for r in range(world_size)]
         max_total_bytes = max(all_sizes)
     else:
         max_total_bytes = own_total_size
 
     aligned_size = (
-        (max_total_bytes + manager.eccheck_buffer_size - 1)
-        // manager.eccheck_buffer_size
+        (max_total_bytes + manager.eccheck_buffer_size - 1) // manager.eccheck_buffer_size
     ) * manager.eccheck_buffer_size
 
     allocated_blocks: Dict[str, torch.Tensor] = {}
@@ -280,15 +268,14 @@ def _allocate_recovered_buffer(size_bytes: int, pin: bool = True) -> torch.Tenso
         except Exception:
             pass
     return allocate_hugepage_tensor(
-        size_bytes,
-        fallback_pin_memory=torch.cuda.is_available() and pin,
-        touch_pages=True,
+        size_bytes, fallback_pin_memory=torch.cuda.is_available() and pin, touch_pages=True
     )
 
 
 # ---------------------------------------------------------------------------
 # Encoding pipeline (save)
 # ---------------------------------------------------------------------------
+
 
 def _eccheck_chunk_take(
     src_pos: int,
@@ -362,8 +349,7 @@ def _copy_buffer_range_from_tensors(
             )
         use_non_blocking = non_blocking and tensor.is_cuda
         tensor_buffer[dst_off : dst_off + nbytes].copy_(
-            tensor_view[local_off : local_off + nbytes],
-            non_blocking=use_non_blocking,
+            tensor_view[local_off : local_off + nbytes], non_blocking=use_non_blocking
         )
 
 
@@ -388,22 +374,12 @@ def _submit_eccheck_d2h_chunk(
         with torch.cuda.stream(d2h_stream):
             start_event.record(d2h_stream)
             _copy_buffer_range_from_tensors(
-                tensor_buffer,
-                range_start,
-                d2h_end,
-                tensor_infos,
-                tensor_data,
-                non_blocking=True,
+                tensor_buffer, range_start, d2h_end, tensor_infos, tensor_data, non_blocking=True
             )
             end_event.record(d2h_stream)
         return start_event, end_event
     _copy_buffer_range_from_tensors(
-        tensor_buffer,
-        range_start,
-        d2h_end,
-        tensor_infos,
-        tensor_data,
-        non_blocking=False,
+        tensor_buffer, range_start, d2h_end, tensor_infos, tensor_data, non_blocking=False
     )
     return None
 
@@ -617,15 +593,31 @@ def _encode_eccheck_with_native(
             p2p_data_size = min(take, max(0, p2p_data_actual_bytes - src_pos))
             p2p_data_is_zero_tail = p2p_data_size == 0
             native.submit_data_for_encoding_thread1(
-                cur_buffer_addr, take, enc_addr1, recv_addr_1,
-                recv_chunk_size, parity_addr1, own_write_addr, partner_write_addr,
-                local_is_zero_tail, remote_is_zero_tail, p2p_data_is_zero_tail,
+                cur_buffer_addr,
+                take,
+                enc_addr1,
+                recv_addr_1,
+                recv_chunk_size,
+                parity_addr1,
+                own_write_addr,
+                partner_write_addr,
+                local_is_zero_tail,
+                remote_is_zero_tail,
+                p2p_data_is_zero_tail,
                 p2p_data_size,
             )
             native.submit_data_for_encoding_thread2(
-                cur_buffer_addr, take, enc_addr2, recv_addr_2,
-                recv_chunk_size, parity_addr2, own_write_addr, partner_write_addr,
-                local_is_zero_tail, remote_is_zero_tail, p2p_data_is_zero_tail,
+                cur_buffer_addr,
+                take,
+                enc_addr2,
+                recv_addr_2,
+                recv_chunk_size,
+                parity_addr2,
+                own_write_addr,
+                partner_write_addr,
+                local_is_zero_tail,
+                remote_is_zero_tail,
+                p2p_data_is_zero_tail,
                 p2p_data_size,
             )
 
@@ -660,6 +652,7 @@ def _encode_eccheck_with_native(
 # Save .pt files
 # ---------------------------------------------------------------------------
 
+
 def _save_eccheck_pt_files(
     checkpoint_name: str,
     rank: int,
@@ -681,26 +674,31 @@ def _save_eccheck_pt_files(
     }
 
     main_file = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
-    from megatron.training.legacy_io_utils import MAGIC_BLOCK, MAGIC_ECCHECK
-
     # Pre-serialize metadata + prepare memoryview for main file
     import pickle as _pickle
+
+    from megatron.training.legacy_io_utils import MAGIC_BLOCK, MAGIC_ECCHECK
+
     meta1 = _pickle.dumps(non_tensor_data)
     meta2 = _pickle.dumps(tensor_infos)
     block_payload_sizes = _block_payload_sizes_for_save(
-        rank, world_size, all_tensor_infos or {}, blocks,
+        rank, world_size, all_tensor_infos or {}, blocks
     )
-    extra = _pickle.dumps({
-        "version": 1, "format": _FORMAT, "rank": rank,
-        "actual_tensor_size": blocks["actual_size"],
-        "pipeline_total_bytes": blocks["pipeline_size"],
-        "aligned_block_size": blocks["aligned_size"],
-        "block_write_sizes": blocks.get("block_write_sizes", {}),
-        "block_payload_sizes": block_payload_sizes,
-        "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
-        "block_files": block_files,
-        "all_tensor_infos": all_tensor_infos if all_tensor_infos is not None else {},
-    })
+    extra = _pickle.dumps(
+        {
+            "version": 1,
+            "format": _FORMAT,
+            "rank": rank,
+            "actual_tensor_size": blocks["actual_size"],
+            "pipeline_total_bytes": blocks["pipeline_size"],
+            "aligned_block_size": blocks["aligned_size"],
+            "block_write_sizes": blocks.get("block_write_sizes", {}),
+            "block_payload_sizes": block_payload_sizes,
+            "flat_key_roots": list(flat_key_roots) if flat_key_roots else [],
+            "block_files": block_files,
+            "all_tensor_infos": all_tensor_infos if all_tensor_infos is not None else {},
+        }
+    )
     buf = full_tensor_buffer[: blocks["actual_size"]]
     if not buf.is_contiguous():
         buf = buf.contiguous()
@@ -722,29 +720,47 @@ def _save_eccheck_pt_files(
 
     # Parallel writes (f.write releases GIL — truly concurrent I/O)
     import concurrent.futures
-    from megatron.training.legacy_io_utils import write_main_prepared, write_block_prepared
+
+    from megatron.training.legacy_io_utils import write_block_prepared, write_main_prepared
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=1 + len(block_names)) as ex:
-        futs = [ex.submit(write_main_prepared, str(main_file), MAGIC_ECCHECK,
-                          meta1, meta2, extra, main_mv, blocks["actual_size"])]
+        futs = [
+            ex.submit(
+                write_main_prepared,
+                str(main_file),
+                MAGIC_ECCHECK,
+                meta1,
+                meta2,
+                extra,
+                main_mv,
+                blocks["actual_size"],
+            )
+        ]
         for name in block_names:
             block_file = checkpoint_dir / f"eccheck_block_rank{rank}_{name}.pt"
             block_write_size = int(block_write_sizes.get(name, blocks[name].numel()))
-            futs.append(ex.submit(write_block_prepared,
-                                  str(block_file), MAGIC_BLOCK,
-                                  block_mvs[name], block_write_size))
+            futs.append(
+                ex.submit(
+                    write_block_prepared,
+                    str(block_file),
+                    MAGIC_BLOCK,
+                    block_mvs[name],
+                    block_write_size,
+                )
+            )
         for f in futs:
             f.result()
-
-
 
 
 # ---------------------------------------------------------------------------
 # Main save entry point
 # ---------------------------------------------------------------------------
 
+
 def save_eccheck_legacy_checkpoint(
     state_dict: Dict[str, Any], checkpoint_name: str, write_to_disk: bool = True
 ) -> None:
+    """Save a legacy ECCHECK checkpoint."""
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -757,7 +773,9 @@ def save_eccheck_legacy_checkpoint(
     total_tensor_size = decomposed.total_tensor_size_bytes
     logger.debug(
         "ECCHECK save timing: copy %.3fs flatten %.3fs decompose %.3fs",
-        save_copy_s, save_flatten_s, decompose_s,
+        save_copy_s,
+        save_flatten_s,
+        decompose_s,
     )
 
     safety_margin = max(int(total_tensor_size * 0.01), manager.eccheck_buffer_size)
@@ -791,12 +809,10 @@ def save_eccheck_legacy_checkpoint(
     blocks = _allocate_eccheck_blocks_legacy(manager, rank_metadata)
 
     # Allocate recv encoding buffers now that we know peer data sizes
-    registry = GlobalMetadataRegistry(
-        rank_metadata=rank_metadata, rank_non_tensor_data={}
-    )
+    registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
     if manager.eccheck_recv_encoding_buffers is None:
-        manager.eccheck_recv_encoding_buffers = (
-            manager.allocate_recv_encoding_buffers_phase2(registry)
+        manager.eccheck_recv_encoding_buffers = manager.allocate_recv_encoding_buffers_phase2(
+            registry
         )
 
     if manager.use_rdma:
@@ -828,13 +844,15 @@ def save_eccheck_legacy_checkpoint(
     e2e_s = time.time() - e2e_t0
     if world_size > 1:
         torch.distributed.barrier()
-    summary = _timing_max_dict({
-        "e2e_s": e2e_s,
-        "d2h_s": d2h_s,
-        "network_encode_s": network_encode_s,
-        "net_s": native_timing["net_s"],
-        "encode_s": native_timing["encode_s"],
-    })
+    summary = _timing_max_dict(
+        {
+            "e2e_s": e2e_s,
+            "d2h_s": d2h_s,
+            "network_encode_s": network_encode_s,
+            "net_s": native_timing["net_s"],
+            "encode_s": native_timing["encode_s"],
+        }
+    )
     if rank == 0:
         logger.info(
             "ECCHECK save timing: e2e_s=%(e2e_s).2fs d2h_s=%(d2h_s).2fs "
@@ -862,10 +880,9 @@ def save_eccheck_legacy_checkpoint(
 # Load helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_eccheck_main_payload_local(
-    checkpoint_dir: Path,
-    rank: int,
-    load_tensor_buffer: bool = True,
+    checkpoint_dir: Path, rank: int, load_tensor_buffer: bool = True
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     main_path = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
     local_payload: Optional[Dict[str, Any]] = None
@@ -873,18 +890,20 @@ def _load_eccheck_main_payload_local(
     if main_path.is_file():
         try:
             from megatron.training.legacy_io_utils import (
-                is_raw_format, read_raw_checkpoint, read_raw_checkpoint_metadata,
-                MAGIC_ECCHECK, pin_payload_tensor_buffer_if_available,
+                MAGIC_ECCHECK,
+                is_raw_format,
+                pin_payload_tensor_buffer_if_available,
+                read_raw_checkpoint,
+                read_raw_checkpoint_metadata,
             )
+
             if is_raw_format(str(main_path), MAGIC_ECCHECK):
                 if load_tensor_buffer:
                     local_payload = read_raw_checkpoint(
-                        str(main_path), MAGIC_ECCHECK, pin_tensor_buffer=True,
+                        str(main_path), MAGIC_ECCHECK, pin_tensor_buffer=True
                     )
                 else:
-                    local_payload = read_raw_checkpoint_metadata(
-                        str(main_path), MAGIC_ECCHECK,
-                    )
+                    local_payload = read_raw_checkpoint_metadata(str(main_path), MAGIC_ECCHECK)
             else:
                 local_payload = torch.load(main_path, map_location="cpu", weights_only=False)
                 if load_tensor_buffer:
@@ -901,14 +920,11 @@ def _load_eccheck_main_payload_local(
 
 
 def _load_eccheck_main_payload(
-    checkpoint_dir: Path,
-    rank: int,
-    world_size: int,
-    load_tensor_buffer: bool = True,
+    checkpoint_dir: Path, rank: int, world_size: int, load_tensor_buffer: bool = True
 ) -> Dict[str, Any]:
     main_path = checkpoint_dir / f"eccheck_main_rank{rank}.pt"
     local_payload, local_error = _load_eccheck_main_payload_local(
-        checkpoint_dir, rank, load_tensor_buffer=load_tensor_buffer,
+        checkpoint_dir, rank, load_tensor_buffer=load_tensor_buffer
     )
 
     if world_size <= 1 or not torch.distributed.is_initialized():
@@ -933,10 +949,7 @@ def _load_eccheck_main_payload(
         stripped = None
 
     if local_error is not None:
-        stripped = {
-            "__eccheck_load_error__": local_error,
-            "__eccheck_load_path__": str(main_path),
-        }
+        stripped = {"__eccheck_load_error__": local_error, "__eccheck_load_path__": str(main_path)}
 
     gathered: List[Optional[Dict[str, Any]]] = [None for _ in range(world_size)]
     torch.distributed.all_gather_object(gathered, stripped)
@@ -989,8 +1002,12 @@ def _copy_block_file_into_tensor(
     if not block_path.is_file():
         raise FileNotFoundError(f"ECCHECK legacy load: missing block file {block_path}")
     from megatron.training.legacy_io_utils import (
-        is_raw_format, read_raw_block_range, MAGIC_BLOCK, pin_uint8_tensor_if_available,
+        MAGIC_BLOCK,
+        is_raw_format,
+        pin_uint8_tensor_if_available,
+        read_raw_block_range,
     )
+
     if dest.device.type != "cpu" or dest.dtype != torch.uint8 or not dest.is_contiguous():
         raise ValueError("ECCHECK raw block destination must be a contiguous CPU uint8 tensor")
     dst = dest.view(-1)
@@ -1066,9 +1083,7 @@ def _load_eccheck_blocks_from_disk_into(
         # rig=2: failed, loads nothing
         elif rank_in_group == 3:
             # Survivor: load p3 (own_buffer = 2·d1⊕2·d3) and p2 (partner_buffer = d0⊕d2)
-            _copy_block_file_into_tensor(
-                checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
-            )
+            _copy_block_file_into_tensor(checkpoint_dir, rank, "own_buffer", blocks["own_buffer"])
             _copy_block_file_into_tensor(
                 checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
             )
@@ -1081,37 +1096,28 @@ def _load_eccheck_blocks_from_disk_into(
     if rank_in_group == 0:
         # Even save roles keep parity in own_buffer and partner data in partner_buffer.
         # HW1 encodes from own_buffer and sends partner_buffer in Step2.
-        _copy_block_file_into_tensor(
-            checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
-        )
+        _copy_block_file_into_tensor(checkpoint_dir, rank, "own_buffer", blocks["own_buffer"])
         _copy_block_file_into_tensor(
             checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
         )
     elif rank_in_group == 1:
-        _copy_block_file_into_tensor(
-            checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
-        )
+        _copy_block_file_into_tensor(checkpoint_dir, rank, "own_buffer", blocks["own_buffer"])
     elif rank_in_group == 3:
-        _copy_block_file_into_tensor(
-            checkpoint_dir, rank, "own_buffer", blocks["own_buffer"]
-        )
+        _copy_block_file_into_tensor(checkpoint_dir, rank, "own_buffer", blocks["own_buffer"])
         _copy_block_file_into_tensor(
             checkpoint_dir, rank, "partner_buffer", blocks["partner_buffer"]
         )
     else:
-        raise RuntimeError(
-            f"ECCHECK legacy load: unexpected rank_in_group={rank_in_group}"
-        )
+        raise RuntimeError(f"ECCHECK legacy load: unexpected rank_in_group={rank_in_group}")
 
 
 # ---------------------------------------------------------------------------
 # Recovery helpers
 # ---------------------------------------------------------------------------
 
+
 def _extract_dense_from_gapped_buffer(
-    gapped_buf: torch.Tensor,
-    chunk_size: int,
-    total_bytes: int,
+    gapped_buf: torch.Tensor, chunk_size: int, total_bytes: int
 ) -> torch.Tensor:
     """Reconstruct a dense byte buffer from a gapped buffer written by C++.
 
@@ -1122,8 +1128,8 @@ def _extract_dense_from_gapped_buffer(
     Mirrors ``_decode_data0_to_linear_first_half`` in basic_ec_legacy.py.
     """
     out = torch.zeros(total_bytes, dtype=torch.uint8, device=gapped_buf.device)
-    src_pos = 0       # position in output (dense)
-    buf_offset = 0    # position in gapped_buf
+    src_pos = 0  # position in output (dense)
+    buf_offset = 0  # position in gapped_buf
     buf_size = gapped_buf.numel()
     while src_pos < total_bytes:
         remaining = total_bytes - src_pos
@@ -1135,9 +1141,7 @@ def _extract_dense_from_gapped_buffer(
                 f"(buf_size={buf_size}, aligned={aligned_offset}, take={take})"
             )
             break
-        out[src_pos : src_pos + take].copy_(
-            gapped_buf[aligned_offset : aligned_offset + take]
-        )
+        out[src_pos : src_pos + take].copy_(gapped_buf[aligned_offset : aligned_offset + take])
         buf_offset = aligned_offset + take
         src_pos += take
     return out
@@ -1146,6 +1150,7 @@ def _extract_dense_from_gapped_buffer(
 # ---------------------------------------------------------------------------
 # Recovery pipeline (load)
 # ---------------------------------------------------------------------------
+
 
 def _run_eccheck_legacy_recovery(
     manager: ECCHECKManager,
@@ -1170,6 +1175,7 @@ def _run_eccheck_legacy_recovery(
         raise RuntimeError("ECCHECK native module is not initialized")
 
     from megatron.training import get_args as _get_args
+
     args = _get_args()
     software_failure = bool(getattr(args, "use_eccheck_software_failure", False))
 
@@ -1250,9 +1256,7 @@ def _run_eccheck_legacy_recovery(
     # HW1 uses an isolated single-physical receive cache. Save may retain its
     # independent two-buffer cache in an in-process manager.
     if manager.eccheck_hw1_recv_encoding_buffers is None:
-        manager.allocate_recv_encoding_buffers_phase2(
-            registry, hw1_single_physical_buffer=True,
-        )
+        manager.allocate_recv_encoding_buffers_phase2(registry, hw1_single_physical_buffer=True)
     __, recv_buf2 = manager.eccheck_hw1_recv_encoding_buffers
     recv_base2 = int(recv_buf2.data_ptr())
 
@@ -1264,9 +1268,9 @@ def _run_eccheck_legacy_recovery(
     if recovered_buffer is not None:
         full_buffers.append(recovered_buffer)
     recovered_alias = (
-        "own" if recovered_buffer is own_buf
-        else "partner" if recovered_buffer is partner_buf
-        else "none"
+        "own"
+        if recovered_buffer is own_buf
+        else "partner" if recovered_buffer is partner_buf else "none"
     )
     logger.debug(
         "ECCHECK HW1 memory layout: role=rig%d alias=recovered:%s "
@@ -1302,29 +1306,23 @@ def _run_eccheck_legacy_recovery(
                 src_off = processed
                 bytes_to_copy = min(take, own_buf.numel() - src_off)
                 if bytes_to_copy > 0:
-                    ctypes.memmove(buffer_array.contents,
-                                   own_base + src_off, bytes_to_copy)
+                    ctypes.memmove(buffer_array.contents, own_base + src_off, bytes_to_copy)
                 if take > bytes_to_copy:
-                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0,
-                                  take - bytes_to_copy)
+                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0, take - bytes_to_copy)
             elif rank_in_group == 1:
                 src_off = processed
                 bytes_to_copy = min(take, partner_buf.numel() - src_off)
                 if bytes_to_copy > 0:
-                    ctypes.memmove(buffer_array.contents,
-                                   partner_base + src_off, bytes_to_copy)
+                    ctypes.memmove(buffer_array.contents, partner_base + src_off, bytes_to_copy)
                 if take > bytes_to_copy:
-                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0,
-                                  take - bytes_to_copy)
+                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0, take - bytes_to_copy)
             elif rank_in_group == 3:
                 src_off = processed
                 bytes_to_copy = min(take, own_buf.numel() - src_off)
                 if bytes_to_copy > 0:
-                    ctypes.memmove(buffer_array.contents,
-                                   own_base + src_off, bytes_to_copy)
+                    ctypes.memmove(buffer_array.contents, own_base + src_off, bytes_to_copy)
                 if take > bytes_to_copy:
-                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0,
-                                  take - bytes_to_copy)
+                    ctypes.memset(buffer_array.contents + bytes_to_copy, 0, take - bytes_to_copy)
             else:
                 # rig2 starts with zeros and receives recovery input from the network.
                 ctypes.memset(buffer_array.contents, 0, take)
@@ -1406,9 +1404,7 @@ def _run_eccheck_legacy_recovery(
             torch.cuda.synchronize()
         t_pipeline_net = time() - t_pipeline_net_start
 
-        logger.debug(
-            f"ECCHECK legacy: hw recovery pipeline done in {t_pipeline_net:.2f}s"
-        )
+        logger.debug(f"ECCHECK legacy: hw recovery pipeline done in {t_pipeline_net:.2f}s")
 
     finally:
         if active_event is not None:
@@ -1420,6 +1416,7 @@ def _run_eccheck_legacy_recovery(
 # ---------------------------------------------------------------------------
 # Two-failure recovery pipeline (load)
 # ---------------------------------------------------------------------------
+
 
 def _run_eccheck_two_failures_recovery(
     manager: ECCHECKManager,
@@ -1508,7 +1505,7 @@ def _run_eccheck_two_failures_recovery(
     ring_depth = _eccheck_hw2_recv_ring_depth()
     if manager.eccheck_hw2_recv_encoding_buffers is None:
         manager.allocate_recv_encoding_buffers_phase2(
-            registry, hw2_single_physical_buffer=True, hw2_ring_depth=ring_depth,
+            registry, hw2_single_physical_buffer=True, hw2_ring_depth=ring_depth
         )
     elif manager.eccheck_hw2_recv_ring_depth != ring_depth:
         raise RuntimeError(
@@ -1527,9 +1524,9 @@ def _run_eccheck_two_failures_recovery(
     if recovered_buffer is not None:
         full_buffers.append(recovered_buffer)
     recovered_alias = (
-        "partner_buffer" if recovered_buffer is partner_buf
-        else "own_buffer" if recovered_buffer is own_buf
-        else "none"
+        "partner_buffer"
+        if recovered_buffer is partner_buf
+        else "own_buffer" if recovered_buffer is own_buf else "none"
     )
     logger.debug(
         "ECCHECK HW2 memory layout: role=rig%d unique_full_blocks=%d "
@@ -1571,42 +1568,34 @@ def _run_eccheck_two_failures_recovery(
     _t0 = time()
     if rank_in_group == 0:
         rig1_rank = manager._get_rank_by_group_position(
-            manager._get_group_id(rank, world_size), 1, world_size,
+            manager._get_group_id(rank, world_size), 1, world_size
         )
         send_size = min(
-            _rank_data_transfer_bytes(registry, rig1_rank, world_size),
-            phase1_buf.numel(),
+            _rank_data_transfer_bytes(registry, rig1_rank, world_size), phase1_buf.numel()
         )
         native.simple_p2p_send(int(phase1_buf.data_ptr()), send_size)
         logger.debug(
-            f"ECCHECK two-failures: rig0 sent d1 to rig1 "
-            f"({send_size / (1024**3):.2f} GB)"
+            f"ECCHECK two-failures: rig0 sent d1 to rig1 " f"({send_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 1:
-        recv_size = min(
-            _rank_data_transfer_bytes(registry, rank, world_size),
-            partner_buf.numel(),
-        )
+        recv_size = min(_rank_data_transfer_bytes(registry, rank, world_size), partner_buf.numel())
         native.simple_p2p_recv(int(partner_buf.data_ptr()), recv_size)
         if recv_size < partner_buf.numel():
             partner_buf[recv_size:].zero_()
         logger.debug(
-            f"ECCHECK two-failures: rig1 received d1 from rig0 "
-            f"({recv_size / (1024**3):.2f} GB)"
+            f"ECCHECK two-failures: rig1 received d1 from rig0 " f"({recv_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 2:
         recv_size = min(phase1_parity_bytes, own_buf.numel())
         native.simple_p2p_recv(int(own_buf.data_ptr()), recv_size)
         logger.debug(
-            f"ECCHECK two-failures: rig2 received p2 from rig3 "
-            f"({recv_size / (1024**3):.2f} GB)"
+            f"ECCHECK two-failures: rig2 received p2 from rig3 " f"({recv_size / (1024**3):.2f} GB)"
         )
     elif rank_in_group == 3:
         send_size = min(phase1_parity_bytes, phase1_buf.numel())
         native.simple_p2p_send(int(phase1_buf.data_ptr()), send_size)
         logger.debug(
-            f"ECCHECK two-failures: rig3 sent p2 to rig2 "
-            f"({send_size / (1024**3):.2f} GB)"
+            f"ECCHECK two-failures: rig3 sent p2 to rig2 " f"({send_size / (1024**3):.2f} GB)"
         )
     t_phase1_p2p = time() - _t0
 
@@ -1632,8 +1621,7 @@ def _run_eccheck_two_failures_recovery(
     free_slots = deque(ring_base + index * buffer_size for index in range(ring_depth))
     inflight: Set[int] = set()
     logger.debug(
-        "ECCHECK HW2 receive ring setup: ring_depth=%d ring_bytes=%d",
-        ring_depth, ring_bytes,
+        "ECCHECK HW2 receive ring setup: ring_depth=%d ring_bytes=%d", ring_depth, ring_bytes
     )
     ring_stall_s = 0.0
     ring_wait_count = 0
@@ -1684,8 +1672,7 @@ def _run_eccheck_two_failures_recovery(
                 )
             if now >= next_warning:
                 logger.warning(
-                    "ECCHECK HW2 waiting for a free receive ring slot for %.1fs",
-                    now - wait_start,
+                    "ECCHECK HW2 waiting for a free receive ring slot for %.1fs", now - wait_start
                 )
                 next_warning = now + 5.0
             sleep(0.001)
@@ -1706,8 +1693,7 @@ def _run_eccheck_two_failures_recovery(
             own_remaining = own_buf.numel() - own_offset_aligned
             partner_remaining = partner_buf.numel() - partner_offset_aligned
             recovered_remaining = (
-                recovered_buffer.numel() - processed
-                if recovered_buffer is not None else take
+                recovered_buffer.numel() - processed if recovered_buffer is not None else take
             )
             if rank_in_group == 1:
                 destination_remaining = min(own_remaining, recovered_remaining)
@@ -1738,9 +1724,12 @@ def _run_eccheck_two_failures_recovery(
                     ctypes.memmove(buffer_array.contents, input_base + src_off, bytes_to_copy)
                 if take > bytes_to_copy:
                     ctypes.memset(
-                        ctypes.cast(ctypes.addressof(buffer_array.contents) + bytes_to_copy,
-                                    ctypes.POINTER(ctypes.c_uint8)),
-                        0, take - bytes_to_copy,
+                        ctypes.cast(
+                            ctypes.addressof(buffer_array.contents) + bytes_to_copy,
+                            ctypes.POINTER(ctypes.c_uint8),
+                        ),
+                        0,
+                        take - bytes_to_copy,
                     )
 
                 enc_addr_0 = _get_free_encoding()
@@ -1767,7 +1756,8 @@ def _run_eccheck_two_failures_recovery(
                     partner_write_addr=partner_write_addr,
                     recovered_write_addr=(
                         int(recovered_buffer.data_ptr()) + processed
-                        if is_failed and recovered_buffer is not None else 0
+                        if is_failed and recovered_buffer is not None
+                        else 0
                     ),
                 )
                 submitted = True
@@ -1805,7 +1795,9 @@ def _run_eccheck_two_failures_recovery(
             )
         logger.debug(
             "ECCHECK HW2 pipeline ring_stall_s=%.3f ring_wait_count=%d max_inflight=%d",
-            ring_stall_s, ring_wait_count, max_inflight,
+            ring_stall_s,
+            ring_wait_count,
+            max_inflight,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
@@ -1813,8 +1805,7 @@ def _run_eccheck_two_failures_recovery(
 
         network_encode = t_phase1_p2p + t_pipeline_net
         logger.debug(
-            f"ECCHECK legacy: two-failure recovery pipeline done in "
-            f"{network_encode:.2f}s"
+            f"ECCHECK legacy: two-failure recovery pipeline done in " f"{network_encode:.2f}s"
         )
 
     finally:
@@ -1834,6 +1825,7 @@ def _run_eccheck_two_failures_recovery(
 # ---------------------------------------------------------------------------
 # State dict reconstruction
 # ---------------------------------------------------------------------------
+
 
 def _tensor_buffer_as_uint8_view(buffer: torch.Tensor) -> torch.Tensor:
     """View checkpoint buffer as contiguous uint8 without copying pinned storage."""
@@ -1876,11 +1868,7 @@ def _coerce_tensor_infos_for_extract(tensor_infos: List[Any]) -> List[Any]:
         coerced = []
         for info in tensor_infos:
             dtype_str = info.dtype
-            dt = (
-                getattr(torch, dtype_str.split(".")[-1])
-                if "." in dtype_str
-                else torch.float32
-            )
+            dt = getattr(torch, dtype_str.split(".")[-1]) if "." in dtype_str else torch.float32
             info.dtype = dt
             coerced.append(info)
         return coerced
@@ -1888,8 +1876,7 @@ def _coerce_tensor_infos_for_extract(tensor_infos: List[Any]) -> List[Any]:
 
 
 def _reconstruct_state_dict_from_eccheck_buffer(
-    main_payload: Dict[str, Any],
-    recovered_buffer: Optional[torch.Tensor],
+    main_payload: Dict[str, Any], recovered_buffer: Optional[torch.Tensor]
 ) -> Dict[str, Any]:
     flat_key_roots = _infer_flat_key_roots(main_payload)
 
@@ -1915,9 +1902,7 @@ def _reconstruct_state_dict_from_eccheck_buffer(
     return result
 
 
-def _reconstruct_state_dict_from_main_tensor_buffer(
-    main_payload: Dict[str, Any],
-) -> Dict[str, Any]:
+def _reconstruct_state_dict_from_main_tensor_buffer(main_payload: Dict[str, Any]) -> Dict[str, Any]:
     flat_key_roots = _infer_flat_key_roots(main_payload)
     tb = main_payload["tensor_buffer"]
     buf = tb.detach().contiguous().reshape(-1).view(torch.uint8)
@@ -1938,9 +1923,8 @@ def _reconstruct_state_dict_from_main_tensor_buffer(
 # Metadata-only reconstruction (no distributed)
 # ---------------------------------------------------------------------------
 
-def state_dict_from_eccheck_main_metadata_only(
-    main_payload: Dict[str, Any]
-) -> Dict[str, Any]:
+
+def state_dict_from_eccheck_main_metadata_only(main_payload: Dict[str, Any]) -> Dict[str, Any]:
     """Build state_dict from eccheck main file payload without distributed.
 
     Used when torch.distributed is not initialized (e.g. load_args_from_checkpoint).
@@ -1973,50 +1957,85 @@ def _eccheck_input_file_signature(checkpoint_dir: Path) -> Tuple[Tuple[str, int,
 
 
 def _eccheck_inprocess_bootstrap_key(
-    checkpoint_dir: Path, rank: int, world_size: int, args: Any, mode: str,
-    rank_in_group: int, cluster_id: int, layout: Dict[str, int],
+    checkpoint_dir: Path,
+    rank: int,
+    world_size: int,
+    args: Any,
+    mode: str,
+    rank_in_group: int,
+    cluster_id: int,
+    layout: Dict[str, int],
 ) -> tuple:
     env_names = (
-        "ECCHECK_USE_ASIO", "ECCHECK_BASE_IP", "ECCHECK_INTERFACE",
-        "ECCHECK_BASE_PORT", "MASTER_ADDR", "MASTER_PORT",
-        "CUDA_VISIBLE_DEVICES", "NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME",
+        "ECCHECK_USE_ASIO",
+        "ECCHECK_BASE_IP",
+        "ECCHECK_INTERFACE",
+        "ECCHECK_BASE_PORT",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "CUDA_VISIBLE_DEVICES",
+        "NCCL_SOCKET_IFNAME",
+        "GLOO_SOCKET_IFNAME",
     )
     rank_ip_env = tuple(
-        sorted((name, value) for name, value in os.environ.items()
-               if name.startswith("ECCHECK_RANK_IP_") or name.startswith("ECCHECK_LOCAL_RANK_NIC_"))
+        sorted(
+            (name, value)
+            for name, value in os.environ.items()
+            if name.startswith("ECCHECK_RANK_IP_") or name.startswith("ECCHECK_LOCAL_RANK_NIC_")
+        )
     )
     failed_roles = (1, 2) if mode == "HW2" else ((1,) if mode == "SW" else (2,))
     return (
-        str(checkpoint_dir.resolve()), _eccheck_input_file_signature(checkpoint_dir),
-        rank, world_size, tuple(sorted(layout.items())), cluster_id, rank_in_group,
+        str(checkpoint_dir.resolve()),
+        _eccheck_input_file_signature(checkpoint_dir),
+        rank,
+        world_size,
+        tuple(sorted(layout.items())),
+        cluster_id,
+        rank_in_group,
         int(getattr(args, "eccheck_recovery_cluster", 0)),
-        int(getattr(args, "eccheck_rig_remap_offset", 0)), failed_roles, mode,
+        int(getattr(args, "eccheck_rig_remap_offset", 0)),
+        failed_roles,
+        mode,
         bool(getattr(args, "use_rdma", False)),
         (torch.distributed.get_backend() if torch.distributed.is_initialized() else None),
-        tuple((name, os.environ.get(name)) for name in env_names), rank_ip_env,
+        tuple((name, os.environ.get(name)) for name in env_names),
+        rank_ip_env,
     )
 
 
 def _metadata_workspace_key(
-    bootstrap_key: tuple, manager: ECCHECKManager, rank_metadata: Dict[int, List[TensorMetadata]],
-    blocks: Dict[str, Any], recovered_capacity: int,
+    bootstrap_key: tuple,
+    manager: ECCHECKManager,
+    rank_metadata: Dict[int, List[TensorMetadata]],
+    blocks: Dict[str, Any],
+    recovered_capacity: int,
 ) -> tuple:
     rank_sizes = tuple(
         (rank, tensor_layout_size(metadata), len(metadata))
         for rank, metadata in sorted(rank_metadata.items())
     )
     return (
-        bootstrap_key, rank_sizes, int(manager.eccheck_buffer_size), 64,
-        int(blocks.get("pipeline_size", 0)), int(blocks.get("aligned_size", 0)),
-        tuple(blocks.get("block_names", ())), int(recovered_capacity),
-        manager.eccheck_data_buffers_count, manager.eccheck_encoding_buffers_count,
+        bootstrap_key,
+        rank_sizes,
+        int(manager.eccheck_buffer_size),
+        64,
+        int(blocks.get("pipeline_size", 0)),
+        int(blocks.get("aligned_size", 0)),
+        tuple(blocks.get("block_names", ())),
+        int(recovered_capacity),
+        manager.eccheck_data_buffers_count,
+        manager.eccheck_encoding_buffers_count,
     )
+
 
 # ---------------------------------------------------------------------------
 # Main load entry point
 # ---------------------------------------------------------------------------
 
+
 def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
+    """Load a legacy ECCHECK checkpoint."""
     checkpoint_dir = _checkpoint_dir_from_path(checkpoint_name)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
@@ -2031,13 +2050,10 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     hw2_ring_depth = _eccheck_hw2_recv_ring_depth() if two_failures else None
     target_cluster = int(getattr(args, "eccheck_recovery_cluster", 0))
     layout = ECCHECKManager._get_group_layout(world_size)
-    num_clusters = int(
-        layout["clusters"] if layout["mode"] == 1 else layout["num_groups"]
-    )
+    num_clusters = int(layout["clusters"] if layout["mode"] == 1 else layout["num_groups"])
     if target_cluster < 0 or target_cluster >= num_clusters:
         raise ValueError(
-            f"ECCHECK recovery cluster {target_cluster} is outside "
-            f"[0, {num_clusters - 1}]"
+            f"ECCHECK recovery cluster {target_cluster} is outside " f"[0, {num_clusters - 1}]"
         )
     # Software-failure behavior remains unchanged. HW/HW2 recovery is confined
     # to one four-node cluster; ranks in other clusters load their local state.
@@ -2090,8 +2106,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if inprocess_cache:
         metadata_start = time.perf_counter()
         bootstrap_key = _eccheck_inprocess_bootstrap_key(
-            checkpoint_dir, rank, world_size, args, _mode, rank_in_group,
-            cluster_id, layout,
+            checkpoint_dir, rank, world_size, args, _mode, rank_in_group, cluster_id, layout
         )
         workspace = manager.find_legacy_inprocess_workspace(bootstrap_key)
         metadata_plan_s += time.perf_counter() - metadata_start
@@ -2107,9 +2122,11 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         cached_recv_buffers = (
             manager.eccheck_hw2_recv_encoding_buffers
             if two_failures
-            else manager.eccheck_recv_encoding_buffers
-            if sw_failure
-            else manager.eccheck_hw1_recv_encoding_buffers
+            else (
+                manager.eccheck_recv_encoding_buffers
+                if sw_failure
+                else manager.eccheck_hw1_recv_encoding_buffers
+            )
         )
         if workspace.get("recv_buffers") is not cached_recv_buffers:
             raise RuntimeError("ECCHECK cached receive-buffer identity changed")
@@ -2123,7 +2140,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         cache_status = "miss"
         metadata_start = time.perf_counter()
         main_payload = _load_eccheck_main_payload(
-            checkpoint_dir, rank, world_size, load_tensor_buffer=load_tensor_buffer,
+            checkpoint_dir, rank, world_size, load_tensor_buffer=load_tensor_buffer
         )
         tensor_infos = main_payload["tensor_infos"]
         local_metadata = _tensor_infos_to_local_metadata(rank, tensor_infos)
@@ -2133,9 +2150,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             rank_metadata = {i: gathered_meta[i] for i in range(world_size)}
         else:
             rank_metadata = {0: local_metadata}
-        registry = GlobalMetadataRegistry(
-            rank_metadata=rank_metadata, rank_non_tensor_data={}
-        )
+        registry = GlobalMetadataRegistry(rank_metadata=rank_metadata, rank_non_tensor_data={})
         total_size = tensor_layout_size(rank_metadata.get(rank, []))
         metadata_plan_s += time.perf_counter() - metadata_start
 
@@ -2149,7 +2164,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             else:
                 required_block_names = ["own_buffer", "partner_buffer"]
             blocks = _allocate_eccheck_blocks_legacy(
-                manager, rank_metadata, block_names=required_block_names,
+                manager, rank_metadata, block_names=required_block_names
             )
         else:
             blocks = {}
@@ -2164,10 +2179,13 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                 local_canonical_required_bytes = _rank_total_bytes(rank_metadata, rank)
                 tensor_buffer = main_payload.get("tensor_buffer")
                 if not isinstance(tensor_buffer, torch.Tensor):
-                    raise RuntimeError("ECCHECK HW2 rig0 requires main tensor_buffer as authoritative d0")
+                    raise RuntimeError(
+                        "ECCHECK HW2 rig0 requires main tensor_buffer as authoritative d0"
+                    )
                 if tensor_buffer.device.type != "cpu" or not tensor_buffer.is_contiguous():
                     raise RuntimeError(
-                        "ECCHECK HW2 rig0 canonical main tensor_buffer must be contiguous CPU storage"
+                        "ECCHECK HW2 rig0 canonical main tensor_buffer must be "
+                        "contiguous CPU storage"
                     )
                 d0 = _tensor_buffer_as_uint8_view(tensor_buffer)
                 if d0.numel() < local_canonical_required_bytes:
@@ -2176,21 +2194,26 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                         f"required={local_canonical_required_bytes}, have={d0.numel()}"
                     )
                 source_tensors = allocate_hugepage_slices(
-                    blocks["aligned_size"], 1,
-                    fallback_pin_memory=torch.cuda.is_available(), touch_pages=True,
+                    blocks["aligned_size"],
+                    1,
+                    fallback_pin_memory=torch.cuda.is_available(),
+                    touch_pages=True,
                 )
                 source_blocks = {"d0": d0, "d1": source_tensors[0]}
                 logger.debug(
                     "ECCHECK HW2 rig0 sources: d0 kind=canonical_main, "
                     "allocated_source_blocks=1, local_bytes=%d, pipeline_bytes=%d",
-                    local_canonical_required_bytes, pipeline_capacity_bytes,
+                    local_canonical_required_bytes,
+                    pipeline_capacity_bytes,
                 )
                 if manager.use_rdma and inprocess_cache:
                     manager.register_buffer(source_blocks["d1"])
             elif rank_in_group == 3:
                 source_tensors = allocate_hugepage_slices(
-                    blocks["aligned_size"], 2,
-                    fallback_pin_memory=torch.cuda.is_available(), touch_pages=True,
+                    blocks["aligned_size"],
+                    2,
+                    fallback_pin_memory=torch.cuda.is_available(),
+                    touch_pages=True,
                 )
                 source_blocks = {"p3": source_tensors[0], "p2": source_tensors[1]}
                 if manager.use_rdma and inprocess_cache:
@@ -2205,7 +2228,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         elif sw_failure:
             if rank_in_group == 0:
                 blocks = _allocate_eccheck_blocks_legacy(
-                    manager, rank_metadata, block_names=["partner_buffer"],
+                    manager, rank_metadata, block_names=["partner_buffer"]
                 )
             elif rank_in_group == 1:
                 actual_tensor_bytes = _max_tensor_bytes_from_registry(registry, world_size)
@@ -2225,7 +2248,8 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             and recovery_cluster_active
             and (
                 manager.eccheck_hw2_recv_encoding_buffers is None
-                if two_failures else manager.eccheck_hw1_recv_encoding_buffers is None
+                if two_failures
+                else manager.eccheck_hw1_recv_encoding_buffers is None
             )
         ):
             manager.allocate_recv_encoding_buffers_phase2(
@@ -2263,29 +2287,35 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
                 )
             elif sw_failure and rank_in_group == 0:
                 _load_eccheck_blocks_from_disk_into(
-                    blocks, checkpoint_dir, rank, rank_in_group, software_failure=True,
+                    blocks, checkpoint_dir, rank, rank_in_group, software_failure=True
                 )
             elif not sw_failure and not two_failures and rank_in_group != 2:
                 _load_eccheck_blocks_from_disk_into(
-                    blocks, checkpoint_dir, rank, rank_in_group, software_failure=False,
+                    blocks, checkpoint_dir, rank, rank_in_group, software_failure=False
                 )
         disk_preload_s = time.perf_counter() - disk_start
 
         if inprocess_cache:
             recovered_capacity = recovered_buffer.numel() if recovered_buffer is not None else 0
             workspace_key = _metadata_workspace_key(
-                bootstrap_key, manager, rank_metadata, blocks, recovered_capacity,
+                bootstrap_key, manager, rank_metadata, blocks, recovered_capacity
             )
             workspace = {
-                "main_payload": main_payload, "rank_metadata": rank_metadata,
-                "registry": registry, "total_size": total_size, "blocks": blocks,
-                "source_blocks": source_blocks, "recovered_buffer": recovered_buffer,
+                "main_payload": main_payload,
+                "rank_metadata": rank_metadata,
+                "registry": registry,
+                "total_size": total_size,
+                "blocks": blocks,
+                "source_blocks": source_blocks,
+                "recovered_buffer": recovered_buffer,
                 "recv_buffers": (
                     manager.eccheck_hw2_recv_encoding_buffers
                     if two_failures
-                    else manager.eccheck_recv_encoding_buffers
-                    if sw_failure
-                    else manager.eccheck_hw1_recv_encoding_buffers
+                    else (
+                        manager.eccheck_recv_encoding_buffers
+                        if sw_failure
+                        else manager.eccheck_hw1_recv_encoding_buffers
+                    )
                 ),
                 "workspace_key": workspace_key,
             }
@@ -2300,34 +2330,35 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
 
     setup_total_s = time.perf_counter() - setup_start
     if inprocess_cache:
-        setup_summary = _timing_max_dict({
-            "metadata_plan_s": metadata_plan_s,
-            "disk_preload_s": disk_preload_s,
-            "alloc_touch_register_s": alloc_touch_register_s,
-            "native_reset_s": native_reset_s,
-            "total_s": setup_total_s,
-        })
+        setup_summary = _timing_max_dict(
+            {
+                "metadata_plan_s": metadata_plan_s,
+                "disk_preload_s": disk_preload_s,
+                "alloc_touch_register_s": alloc_touch_register_s,
+                "native_reset_s": native_reset_s,
+                "total_s": setup_total_s,
+            }
+        )
         if rank == 0:
             logger.info(
                 "ECCHECK %s in-process setup cache=%s metadata_plan_s=%.3f "
                 "disk_preload_s=%.3f alloc_touch_register_s=%.3f "
                 "native_reset_s=%.3f total_s=%.3f",
-                "software" if sw_failure else "hardware", cache_status,
+                "software" if sw_failure else "hardware",
+                cache_status,
                 setup_summary["metadata_plan_s"],
                 setup_summary["disk_preload_s"],
                 setup_summary["alloc_touch_register_s"],
-                setup_summary["native_reset_s"], setup_summary["total_s"],
+                setup_summary["native_reset_s"],
+                setup_summary["total_s"],
             )
 
     # Sync all ranks after setup so network timing excludes setup skew.
     barrier_s = _timed_barrier()
 
-    should_time_recovery_to_forward = (
-        _mode in ("HW", "HW2")
-        and (
-            not getattr(args, "ft_inprocess_recovery_benchmark", False)
-            or bool(getattr(args, "_ft_inprocess_recovery_active", False))
-        )
+    should_time_recovery_to_forward = _mode in ("HW", "HW2") and (
+        not getattr(args, "ft_inprocess_recovery_benchmark", False)
+        or bool(getattr(args, "_ft_inprocess_recovery_active", False))
     )
     if should_time_recovery_to_forward:
         if not recovery_cluster_active:
@@ -2338,8 +2369,9 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
             recovery_role = "failed" if rank_in_group == 2 else "survivor"
         try:
             from megatron.training.global_vars import start_recovery_to_forward_timer
+
             start_recovery_to_forward_timer(
-                "ECCHECK", "network_recovery", role=recovery_role, rank0_only_max=True,
+                "ECCHECK", "network_recovery", role=recovery_role, rank0_only_max=True
             )
         except Exception:
             pass
@@ -2377,6 +2409,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if should_time_recovery_to_forward:
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("eccheck_network_done")
         except Exception:
             pass
@@ -2386,22 +2419,15 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if not recovery_cluster_active:
         rebuild_recovered_buffer = None
     elif sw_failure:
-        rebuild_recovered_buffer = (
-            recovered_buffer if rank_in_group == 1 else None
-        )
+        rebuild_recovered_buffer = recovered_buffer if rank_in_group == 1 else None
     elif two_failures:
-        rebuild_recovered_buffer = (
-            recovered_buffer if rank_in_group in (1, 2) else None
-        )
+        rebuild_recovered_buffer = recovered_buffer if rank_in_group in (1, 2) else None
     else:
-        rebuild_recovered_buffer = (
-            recovered_buffer if rank_in_group == 2 else None
-        )
+        rebuild_recovered_buffer = recovered_buffer if rank_in_group == 2 else None
 
     t_rebuild = time.time()
     state_dict = _reconstruct_state_dict_from_eccheck_buffer(
-        main_payload,
-        recovered_buffer=rebuild_recovered_buffer,
+        main_payload, recovered_buffer=rebuild_recovered_buffer
     )
     rebuild_sd = time.time() - t_rebuild
     native_timing = _native_ft_timing(manager._eccheck_native)
@@ -2421,6 +2447,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         "recovery_cluster": float(target_cluster),
     }
     from megatron.training.global_vars import set_ft_load_timing_context
+
     set_ft_load_timing_context("ECCHECK", _mode, timings)
 
     load_log = dict(timings)
@@ -2437,11 +2464,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         and getattr(args, "ft_inprocess_recovery_benchmark", False)
         and not getattr(args, "_ft_inprocess_recovery_active", False)
     )
-    if (
-        prebenchmark_software_load
-        and manager.use_rdma
-        and recovered_buffer is not None
-    ):
+    if prebenchmark_software_load and manager.use_rdma and recovered_buffer is not None:
         manager.unregister_buffer(recovered_buffer)
         if rank == 0:
             logger.info(
@@ -2452,6 +2475,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if should_time_recovery_to_forward:
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("eccheck_rebuild_done")
             mark_recovery_to_forward_timer("eccheck_final_barrier_start")
         except Exception:
@@ -2467,12 +2491,14 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
         if should_time_recovery_to_forward:
             try:
                 from megatron.training.global_vars import mark_recovery_to_forward_timer
+
                 mark_recovery_to_forward_timer("eccheck_final_barrier_done")
             except Exception:
                 pass
     elif skip_final_barrier and should_time_recovery_to_forward:
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("eccheck_final_barrier_skipped_inprocess")
         except Exception:
             pass
@@ -2480,6 +2506,7 @@ def load_eccheck_legacy_checkpoint(checkpoint_name: str) -> Dict[str, Any]:
     if should_time_recovery_to_forward:
         try:
             from megatron.training.global_vars import mark_recovery_to_forward_timer
+
             mark_recovery_to_forward_timer("eccheck_load_return")
         except Exception:
             pass

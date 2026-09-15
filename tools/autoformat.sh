@@ -1,44 +1,88 @@
 #!/bin/bash
-set -euox pipefail
-
-GIT_VERSION=$(git version | awk '{print $3}')
-GIT_MAJOR=$(echo $GIT_VERSION | awk -F. '{print $1}')
-GIT_MINOR=$(echo $GIT_VERSION | awk -F. '{print $2}')
-
-if [[ $GIT_MAJOR -eq 2 && $GIT_MINOR -lt 31 ]]; then
-    echo "Git version must be at least 2.31.0. Found $GIT_VERSION"
-    exit 1
-fi
+set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-CHECK_ONLY=${CHECK_ONLY:-false}
+REPO_ROOT=$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+CHECK_ONLY=${CHECK_ONLY:-true}
 SKIP_DOCS=${SKIP_DOCS:-false}
-
 BASE_REF=${BASE_REF:-main}
-CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base origin/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
-ADDITIONAL_ARGS=""
-ADDITIONAL_BLACK_ARGS=""
-ADDITIONAL_PYLINT_ARGS=""
-ADDITIONAL_RUFF_ARGS=""
 
-if [[ $CHECK_ONLY == true ]]; then
-    ADDITIONAL_ARGS="--check"
-    ADDITIONAL_BLACK_ARGS="--diff"
-    ADDITIONAL_RUFF_ARGS="--no-fix"
+files=()
+declare -A seen=()
+
+is_included_python_file() {
+    local file=${1#./}
+    [[ $file == *.py && -f $file ]] || return 1
+    [[ /$file/ != */build/* ]] || return 1
+    [[ /$file/ != */.venv/* ]] || return 1
+    [[ /$file/ != */generated/* ]] || return 1
+    [[ /$file/ != */data/* ]] || return 1
+}
+
+add_file() {
+    local file=$1
+    if is_included_python_file "$file" && [[ -z ${seen["$file"]+x} ]]; then
+        files+=("$file")
+        seen["$file"]=1
+    fi
+}
+
+add_nul_delimited_files() {
+    local file
+    while IFS= read -r -d '' file; do
+        add_file "$file"
+    done
+}
+
+if (( $# > 0 )); then
+    for file in "$@"; do
+        add_file "$file"
+    done
 else
-    ADDITIONAL_RUFF_ARGS="--fix"
+    if git show-ref --verify --quiet "refs/remotes/origin/$BASE_REF"; then
+        comparison_ref="origin/$BASE_REF"
+    elif git show-ref --verify --quiet "refs/heads/$BASE_REF"; then
+        comparison_ref="$BASE_REF"
+    else
+        comparison_ref=HEAD
+    fi
+
+    add_nul_delimited_files < <(
+        git diff --name-only -z --diff-filter=ACMR "$comparison_ref...HEAD" -- '*.py'
+    )
+    add_nul_delimited_files < <(
+        git diff --cached --name-only -z --diff-filter=ACMR -- '*.py'
+    )
+    add_nul_delimited_files < <(
+        git diff --name-only -z --diff-filter=ACMR -- '*.py'
+    )
+    add_nul_delimited_files < <(
+        git ls-files --others --exclude-standard -z -- '*.py'
+    )
 fi
 
+if (( ${#files[@]} == 0 )); then
+    echo "No Python files to check."
+    exit 0
+fi
+
+pylint_args=()
 if [[ $SKIP_DOCS == true ]]; then
-    ADDITIONAL_PYLINT_ARGS="--disable=C0115,C0116"
+    pylint_args+=("--disable=C0115,C0116")
 fi
 
-if [[ -n "$CHANGED_FILES" ]]; then
-    black --skip-magic-trailing-comma --skip-string-normalization $ADDITIONAL_ARGS $ADDITIONAL_BLACK_ARGS --verbose $CHANGED_FILES
-    isort $ADDITIONAL_ARGS $CHANGED_FILES
-    pylint $ADDITIONAL_PYLINT_ARGS $CHANGED_FILES
-    ruff check $ADDITIONAL_RUFF_ARGS $CHANGED_FILES
-    mypy --explicit-package-bases --follow-imports=skip $CHANGED_FILES || true
+if [[ $CHECK_ONLY == false ]]; then
+    black "${files[@]}"
+    isort "${files[@]}"
+    ruff check --fix "${files[@]}"
+    flake8 "${files[@]}"
+    pylint "${pylint_args[@]}" "${files[@]}"
 else
-    echo Changeset is empty, all good.
+    black --check --diff "${files[@]}"
+    isort --check-only "${files[@]}"
+    flake8 "${files[@]}"
+    pylint "${pylint_args[@]}" "${files[@]}"
+    ruff check --no-fix "${files[@]}"
 fi

@@ -353,12 +353,17 @@ def validate_args(args, defaults={}):
     _ec_legacy_flags = (
         bool(getattr(args, "use_basic_ec", False)),
         bool(getattr(args, "use_concord", False)),
+        bool(getattr(args, "use_eccheck", False)),
         bool(getattr(args, "use_gemini_replicas", False)),
     )
     if sum(_ec_legacy_flags) > 1:
         raise RuntimeError(
-            "At most one of --use-basic-ec, --use-concord, and "
+            "At most one of --use-basic-ec, --use-concord, --use-eccheck, and "
             "--use-gemini-replicas may be enabled."
+        )
+    if any(_ec_legacy_flags) and args.ckpt_format != "torch":
+        raise RuntimeError(
+            "Legacy checkpoint schemes require --ckpt-format torch."
         )
     if (
         getattr(args, "concord_hw_early_optimizer", False)
@@ -1990,9 +1995,6 @@ def _add_training_args(parser):
                        help='When layer-wise update is enabled but layer structure cannot be '
                        'automatically detected, use fallback grouping strategy that splits '
                        'parameters into approximately equal-sized groups based on --num-layers.')
-    group.add_argument('--use-layer-transfer', action='store_true',
-                       default=False,
-                       help='Use layer-wise tensor transfer instead of standard tensor transfer.')
     group.add_argument('--deterministic-mode', action='store_true',
                        help='Choose code that has deterministic execution. This usually '
                        'means slower execution, but is good for debugging and testing.')
@@ -2544,26 +2546,11 @@ def _add_checkpointing_args(parser):
                             'tensors to transformer layers instead of a separate group. '
                             'Reduces block_size inflation from heterogeneous common data across PP ranks.')
 
-    # use gemini checkpointing arguments
-    group.add_argument('--use-gemini', action='store_true',
-                       help='Enable Gemini checkpointing. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
-    group.add_argument('--use-gemini-software-failure', action='store_true',
-                       help='Enable Gemini checkpointing for software failure. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
-    group.add_argument('--use-gemini-hardware-failure', action='store_true',
-                       help='Enable Gemini checkpointing for hardware failure. This is a more efficient way to checkpoint the model, but it is only supported in the Gemini framework.')
-    group.add_argument('--use-gemini-optimized', action='store_true',
-                       help='Enable optimized Gemini checkpointing without torch.save serialization overhead. '
-                            'Uses continuous buffer approach for direct GPU-to-CPU transfer and zero-copy communication. '
-                            'This eliminates serialization/deserialization overhead and improves checkpoint exchange performance. '
-                            'When enabled, tensors are copied directly to a continuous CPU buffer during preload phase, '
-                            'avoiding expensive pickle serialization in torch.save.')
+    # RDMA transport arguments
     group.add_argument('--use-rdma', action='store_true',
-                       help='Enable RDMA transport for Gemini checkpointing data exchange. '
-                            'When enabled, uses InfiniBand RDMA (via libibverbs) instead of TCP/ASIO for '
-                            'network communication between paired ranks. Requires InfiniBand hardware and '
-                            'RDMA support. Buffers are automatically registered on first allocation during save phase. '
-                            'This can provide lower latency and higher bandwidth compared to TCP, especially for '
-                            'large checkpoint transfers. Only effective when used with --use-gemini-optimized.')
+                       help='Enable RDMA transport for checkpointing data exchange. '
+                            'When enabled, supported checkpoint schemes use InfiniBand RDMA (via libibverbs) '
+                            'instead of TCP/ASIO. Requires InfiniBand hardware and RDMA support.')
     
     # Gemini Replicas checkpointing arguments (multi-replica with round-robin placement)
     group.add_argument('--use-gemini-replicas', action='store_true',
@@ -2574,8 +2561,8 @@ def _add_checkpointing_args(parser):
                             'standard Gemini (2 replicas) at the cost of more storage overhead.')
     group.add_argument('--use-gemini-replicas-optimized', action='store_true',
                        help='Enable optimized Gemini Replicas checkpointing without torch.save serialization overhead. '
-                            'Similar to --use-gemini-optimized but supports multiple replicas (configurable via '
-                            '--gemini-replicas-num). Uses continuous buffer approach and ASIO-based network '
+                            'Supports multiple replicas (configurable via --gemini-replicas-num). Uses continuous '
+                            'buffer approach and ASIO-based network '
                             'communication for efficient multi-target broadcast. When enabled, data is sent to '
                             'multiple target ranks simultaneously using asynchronous I/O.')
     group.add_argument('--gemini-replicas-num', type=int, default=3,

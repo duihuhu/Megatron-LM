@@ -449,7 +449,6 @@ def _native_legacy_inprocess_enabled(args) -> bool:
             "use_concord",
             "use_eccheck",
             "use_basic_ec",
-            "use_gemini",
             "use_gemini_replicas",
         )
     )
@@ -1315,6 +1314,13 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                         f"Concord --concord-failed-ranks rank {fr} out of range [0, {world_size - 1}]"
                     )
             args.concord_failed_ranks_parsed = failed_ranks
+    if getattr(args, "use_eccheck", False) and (
+        args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
+    ):
+        raise RuntimeError(
+            "ECCHECK only supports torch legacy checkpoints. "
+            "Please use --ckpt-format torch without distributed checkpoint save."
+        )
     if getattr(args, "use_gemini_replicas", False) and (
         args.ckpt_format != "torch" or ckpt_type != CheckpointType.LEGACY
     ):
@@ -2893,7 +2899,6 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                 "use_concord",
                 "use_eccheck",
                 "use_basic_ec",
-                "use_gemini",
                 "use_gemini_replicas",
             )
         )

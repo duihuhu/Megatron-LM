@@ -37,7 +37,7 @@ megatron/core/dist_checkpointing/strategies/
   setup_simple_concord.py    Concord native build
   setup_simple.py            ECCHECK native build
   setup_simple_basic_ec.py    BasicEC native build
-  setup_simple_gemini.py     Gemini native build
+  build_gemini_replicas.sh  Gemini Replicas native build
 
 pre-tests/gpt2/para_a800/
   {2.7B,7B,10B,14B,20B}-4nodes/   per-scheme launch scripts
@@ -54,7 +54,7 @@ cd megatron/core/dist_checkpointing/strategies
 python3 setup_simple_concord.py build_ext --inplace
 bash build_clean.sh            # ECCHECK
 bash build_clean_basic_ec.sh    # BasicEC
-python3 setup_simple_gemini.py build_ext --inplace
+bash build_gemini_replicas.sh  # Gemini Replicas
 ```
 
 Dependencies: PyTorch, pybind11, Boost.Asio, ISA-L, libibverbs / rdmacm, and CUDA for GPUDirect paths.

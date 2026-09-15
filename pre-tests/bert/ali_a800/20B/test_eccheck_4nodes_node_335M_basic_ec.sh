@@ -38,21 +38,21 @@ export BASIC_EC_LOCAL_RANK_NIC_4=eth1
 export BASIC_EC_LOCAL_RANK_NIC_5=eth1
 export BASIC_EC_LOCAL_RANK_NIC_6=eth1
 export BASIC_EC_LOCAL_RANK_NIC_7=eth1
-#  priority from
+# Network address selection priority:
 #  ┌──────────────────────────────────────────┬──────────────────────────┐
-#  │                 环境变量                 │           用途           │
+#  │                 Environment variable                 │           Purpose           │
 #  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ BASIC_EC_RANK_IP_0=10.0.0.1               │ 每个 rank 显式指定 IP    │
+#  │ BASIC_EC_RANK_IP_0=10.0.0.1               │ Explicit IP for each rank    │
 #  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ BASIC_EC_LOCAL_RANK_NIC_0=mlx5_0          │ 每个 local_rank 绑定 NIC │
+#  │ BASIC_EC_LOCAL_RANK_NIC_0=mlx5_0          │ Bind a NIC for each local_rank │
 #  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ BASIC_EC_NIC_LIST + BASIC_EC_RANKS_PER_NIC │ 批量 NIC 分配            │
+#  │ BASIC_EC_NIC_LIST + BASIC_EC_RANKS_PER_NIC │ Bulk NIC assignment            │
 #  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ BASIC_EC_BASE_IP=10.0.0.1                 │ 所有 rank 同一 IP        │
+#  │ BASIC_EC_BASE_IP=10.0.0.1                 │ Same IP for all ranks        │
 #  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ BASIC_EC_INTERFACE=bond0                  │ 从指定接口自动检测 IP    │
+#  │ BASIC_EC_INTERFACE=bond0                  │ Auto-detect IP from interface    │
 #  ├──────────────────────────────────────────┼──────────────────────────┤
-#  │ MASTER_ADDR                              │ 最终 fallback            │
+#  │ MASTER_ADDR                              │ Final fallback            │
 #  └──────────────────────────────────────────┴──────────────────────────┘
 # If first argument is a numeric node rank use it, otherwise default to 0
 NODE_RANK=0
@@ -101,7 +101,7 @@ DATA_CACHE_PATH="${DATA_CACHE_PATH:-/workspace/Megatron-LM/pre-tests/bert/bert_d
 
 SHM_PKT="/dev/shm/shm_pkt"
 
-# Remaining args after node-rank and GPU ids are passed to the training script
+# Remaining args after node-rank and GPU IDs are passed to the training script
 ARGS_TO_PASS=("$@")
 
 # Recovery mode args: enabled only for software / hardware load tests
@@ -123,7 +123,7 @@ case "$MODE" in
         ;;
 esac
 
-# Model related configuration here, please do not overlap with json config
+# Define model configuration here without duplicating the JSON configuration
 HIDDEN_SIZE=5120
 NUM_ATTENTION_HEADS=40
 NUM_LAYERS=64

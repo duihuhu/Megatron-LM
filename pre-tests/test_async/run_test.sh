@@ -1,58 +1,58 @@
 #!/bin/bash
-# 运行分布式异步 checkpoint 测试
-# 两个独立的程序，模拟分布式训练场景
+# Run the distributed asynchronous checkpoint test
+# Two independent programs simulating distributed training
 
 echo "======================================================================"
-echo "分布式异步 Checkpoint 测试（三种方案对比）"
+echo "Distributed Asynchronous Checkpoint Test (Three Approaches)"
 echo "======================================================================"
 echo ""
-echo "方案 1: 原生 torch (torch.to + dist.send)"
-echo "方案 2: CPUMemoryPool + dist.send (共享内存 + PyTorch 序列化)"
-echo "方案 3: CPUMemoryPool + Raw Bytes (共享内存 + 原始字节) ⭐ 最优"
+echo "Approach 1: Native torch (torch.to + dist.send)"
+echo "Approach 2: CPUMemoryPool + dist.send (shared memory + PyTorch serialization)"
+echo "Approach 3: CPUMemoryPool + Raw Bytes (shared memory + original bytes) ⭐ optimal"
 echo ""
-echo "启动两个进程 (rank 0 和 rank 1)..."
+echo "Starting two processes (rank 0 and rank 1)..."
 echo ""
 
-# 设置环境变量
+# Set environment variables
 export MASTER_ADDR=localhost
 export MASTER_PORT=29500
 export WORLD_SIZE=2
 
-# 测试模式（可以修改为 torch, pool, pool-raw, 或 all）
+# Test mode (may be torch, pool, pool-raw, or all)
 MODE=${1:-all}
 
-echo "测试模式: $MODE"
+echo "Test mode: $MODE"
 echo ""
 
-# 启动 rank 0
-echo "启动 Rank 0..."
+# Start rank 0
+echo "Starting Rank 0..."
 python test_async_checkpoint.py --rank 0 --world-size 2 --mode $MODE &
 PID0=$!
 
-# 等待一下，确保 rank 0 先启动
+# Wait briefly to ensure rank 0 starts first
 sleep 1
 
-# 启动 rank 1  
-echo "启动 Rank 1..."
+# Start rank 1
+echo "Starting Rank 1..."
 python test_async_checkpoint.py --rank 1 --world-size 2 --mode $MODE &
 PID1=$!
 
 echo ""
-echo "等待两个进程完成..."
+echo "Waiting for both processes to finish..."
 echo "  Rank 0 PID: $PID0"
 echo "  Rank 1 PID: $PID1"
 
-# 等待两个进程
+# Wait for both processes
 wait $PID0
 wait $PID1
 
 echo ""
 echo "======================================================================"
-echo "测试完成！"
+echo "Test completed!"
 echo "======================================================================"
 echo ""
-echo "提示："
-echo "  • 查看 Rank 0 的输出获取详细性能对比"
-echo "  • 方案 3 (CPUMemoryPool + Raw Bytes) 应该是最快的"
+echo "Tip: "
+echo "  • See Rank 0 output for a detailed performance comparison"
+echo "  • Approach 3 (CPUMemoryPool + Raw Bytes) should be the fastest"
 echo ""
 

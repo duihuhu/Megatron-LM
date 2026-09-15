@@ -16,7 +16,7 @@ export CUDA_LAUNCH_BLOCKING=1
 
 
 GPUS_PER_NODE=1
-# Change for multinode config
+# Adjust for multi-node configuration
 MASTER_ADDR=128.105.146.42
 MASTER_PORT=29500
 NNODES=2
@@ -55,7 +55,7 @@ export GLOO_SOCKET_IFNAME=eno33np0
 
 TEST_NUM=${2:-0}
 
-# fixed Model related configuration here, pls not overlap with json config
+# Define fixed model settings here; do not duplicate them in the JSON configuration
 HIDDEN_SIZE=1024
 NUM_ATTENTION_HEADS=16
 SEQ_LENGTH=1024
@@ -64,46 +64,46 @@ MICRO_BATCH_SIZE=4
 GLOBAL_BATCH_SIZE=16
 
 DISTRIBUTED_ARGS=(
-    --nproc_per_node $GPUS_PER_NODE 
-    --nnodes $NNODES 
-    --node_rank $NODE_RANK 
-    --master_addr $MASTER_ADDR 
+    --nproc_per_node $GPUS_PER_NODE
+    --nnodes $NNODES
+    --node_rank $NODE_RANK
+    --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
 )
 
 DATA_ARGS=(
-    --vocab-file $VOCAB_FILE 
-    --merge-file $MERGE_FILE 
-    --mock-data 
+    --vocab-file $VOCAB_FILE
+    --merge-file $MERGE_FILE
+    --mock-data
 )
 
-# Model related configuration here, pls not overlap with json config
+# Define model settings here; do not duplicate them in the JSON configuration
 GPT_ARGS=(
-    --no-async-tensor-model-parallel-allreduce 
-    --hidden-size $HIDDEN_SIZE 
-    --num-attention-heads $NUM_ATTENTION_HEADS 
-    --seq-length $SEQ_LENGTH 
-    --max-position-embeddings $MAX_POSITION_EMBEDDINGS 
-    --micro-batch-size $MICRO_BATCH_SIZE 
-    --global-batch-size $GLOBAL_BATCH_SIZE 
-    --lr 0.00015 
+    --no-async-tensor-model-parallel-allreduce
+    --hidden-size $HIDDEN_SIZE
+    --num-attention-heads $NUM_ATTENTION_HEADS
+    --seq-length $SEQ_LENGTH
+    --max-position-embeddings $MAX_POSITION_EMBEDDINGS
+    --micro-batch-size $MICRO_BATCH_SIZE
+    --global-batch-size $GLOBAL_BATCH_SIZE
+    --lr 0.00015
     --train-iters 13
-    --lr-decay-iters 320000 
-    --lr-decay-style cosine 
-    --min-lr 1.0e-5 
-    --weight-decay 1e-2 
-    --lr-warmup-fraction .01 
-    --clip-grad 1.0 
-    --fp16 
-    --tokenizer-type GPT2BPETokenizer 
-    --use-mcore-models 
-    --transformer-impl transformer_engine 
-    --no-scatter-gather-tensors-in-pipeline 
-    --num-layers 12  
+    --lr-decay-iters 320000
+    --lr-decay-style cosine
+    --min-lr 1.0e-5
+    --weight-decay 1e-2
+    --lr-warmup-fraction .01
+    --clip-grad 1.0
+    --fp16
+    --tokenizer-type GPT2BPETokenizer
+    --use-mcore-models
+    --transformer-impl transformer_engine
+    --no-scatter-gather-tensors-in-pipeline
+    --num-layers 12
 )
 
-#replication-factor是副本数量
-#replication-jump是在多个副本的时候，将自己的副本放到哪个rank上
+# replication-factor is the number of replicas
+# replication-jump selects the rank on which to place a replica when multiple replicas are used
 MODEL_PARALLEL_ARGS=(
 	--tensor-model-parallel-size 1
 	--pipeline-model-parallel-size 2
@@ -115,8 +115,8 @@ MODEL_PARALLEL_ARGS=(
 
     # --use-persistent-ckpt-worker
 
-    # no use for replication
-    # --async-save 
+    # Not used for replication
+    # --async-save
     # --ckpt-format torch_dist
 )
 
@@ -124,12 +124,12 @@ EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
     --save-interval 4
     # --non-persistent-save-interval 7
-    --eval-interval 10 
+    --eval-interval 10
     --save $SHM_CHECKPOINT_PATH
-    # --save $CHECKPOINT_PATH 
-    # --load $CHECKPOINT_PATH 
+    # --save $CHECKPOINT_PATH
+    # --load $CHECKPOINT_PATH
     --eval-iters 10
-    --tensorboard-dir $TENSORBOARD_LOGS_PATH 
+    --tensorboard-dir $TENSORBOARD_LOGS_PATH
     --logging-level 4
 )
 

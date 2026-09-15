@@ -5,22 +5,22 @@ from torch.utils.data import DataLoader, TensorDataset
 import torch.optim as optim
 import os
 
-# 初始化分布式进程组
+# Initialize the distributed process group
 def setup(rank, world_size):
     dist.init_process_group(
-        backend='nccl',               # 使用 NCCL 后端
-        init_method='env://',          # 使用环境变量初始化
-        world_size=world_size,        # 总进程数
-        rank=rank                      # 当前进程的 rank
+        backend='nccl',               # Use the NCCL backend
+        init_method='env://',          # Initialize using environment variables
+        world_size=world_size,        # Total number of processes
+        rank=rank                      # Rank of the current process
     )
-    torch.cuda.set_device(rank)  # 设置每个进程使用的 GPU
+    torch.cuda.set_device(rank)  # Set the GPU used by each process
 
     print(f"Process {rank} initialized.")
-# 清理分布式环境
+# Clean up the distributed environment
 def cleanup():
     dist.destroy_process_group()
 
-# 创建模型
+# Create the model
 class SimpleModel(nn.Module):
     def __init__(self):
         super(SimpleModel, self).__init__()
@@ -29,7 +29,7 @@ class SimpleModel(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
-# 分布式训练函数
+# Distributed training function
 def train(rank, world_size):
     setup(rank, world_size)
 
@@ -55,14 +55,14 @@ def train(rank, world_size):
 
     cleanup()
 
-# 启动分布式训练
+# Start distributed training
 def main():
-    world_size = 2  # 总进程数为 2
-    rank = 1  # 工作节点的 rank（Server 2）
+    world_size = 2  # Total number of processes is 2
+    rank = 1  # Worker node rank (Server 2)
 
-    # 设置主节点的地址和端口
-    os.environ['MASTER_ADDR'] = '10.156.154.36'  # 主节点的 IP 地址
-    os.environ['MASTER_PORT'] = '6000'       # 端口号
+    # Set the primary node address and port
+    os.environ['MASTER_ADDR'] = '10.156.154.36'  # Primary node IP address
+    os.environ['MASTER_PORT'] = '6000'       # Port number
 
     train(rank, world_size)
 

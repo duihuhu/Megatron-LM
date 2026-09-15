@@ -2,11 +2,11 @@
 # bash test_ft_simulate_multinode_rtime.sh  0 2 1
 # bash test_ft_simulate_multinode_rtime.sh 1 2 1
 
-#生成数据
-#python preprocess_data.py   --input /workspace/data/text/AA/wiki.jsonl   --output-prefix /workspace/data/text/AA/wiki   --tokenizer-type BertWordPieceCase   --vocab-file /workspace/Megatron-LM/pre-tests/bert/data/vocab.txt   --json-keys text   --workers 32   --append-eod 
+# Generate data
+# python preprocess_data.py   --input /workspace/data/text/AA/wiki.jsonl   --output-prefix /workspace/data/text/AA/wiki   --tokenizer-type BertWordPieceCase   --vocab-file /workspace/Megatron-LM/pre-tests/bert/data/vocab.txt   --json-keys text   --workers 32   --append-eod
 # =============================================================================
-# 使用 ft_launcher 在单机多卡上模拟多节点训练
-# 用途: 测试多节点容错逻辑，但只用一台机器
+# Use ft_launcher to simulate multi-node training on one multi-GPU host
+# Purpose: test multi-node fault-tolerance logic using only one host
 # =============================================================================
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export DEBUG_COMMUNICATE=1
@@ -17,106 +17,106 @@ export NCCL_DEBUG_FILE=./nccl.log
 export NCCL_DEBUG_SUBSYS=ALL
 
 # =============================================================================
-# 模拟多节点配置
+# Simulated multi-node configuration
 # =============================================================================
-# 参数说明:
-#   $1: 模拟的节点rank (0, 1, 2, ...)
-#   $2: 总节点数 (默认2)
-#   $3: 每个模拟节点的GPU数 (默认1)
+# Arguments:
+#   $1: Simulated node rank (0, 1, 2, ...)
+#   $2: Total node count (default: 2)
+#   $3: GPUs per simulated node (default: 1)
 
-NODE_RANK=${1:-0}           # 当前模拟节点的rank
-TOTAL_NODES=${2:-2}         # 模拟的总节点数
-GPUS_PER_NODE=${3:-1}       # 每个模拟节点使用的GPU数
+NODE_RANK=${1:-0}           # Current simulated node rank
+TOTAL_NODES=${2:-2}         # Total simulated node count
+GPUS_PER_NODE=${3:-1}       # GPUs used by each simulated node
 export HOSTNAME="simnode${NODE_RANK}"
 # export CUDA_VISIBLE_DEVICES=$NODE_RANK
-# 验证参数
+# Validate arguments
 if [ -z "$1" ]; then
-    echo "错误: 需要指定节点rank"
-    echo "用法: $0 <node_rank> [total_nodes] [gpus_per_node]"
-    echo "示例:"
-    echo "  终端1: $0 0 2 1  # 模拟节点0，共2个节点，每节点1GPU"
-    echo "  终端2: $0 1 2 1  # 模拟节点1，共2个节点，每节点1GPU"
+    echo "Error: a node rank must be specified"
+    echo "Usage: $0 <node_rank> [total_nodes] [gpus_per_node]"
+    echo "Examples:"
+    echo "  Terminal 1: $0 0 2 1  # simulate node 0 of 2, with 1 GPU per node"
+    echo "  Terminal 2: $0 1 2 1  # simulate node 1 of 2, with 1 GPU per node"
     exit 1
 fi
 
 # =============================================================================
-# 网络配置 - 单机模拟多节点
+# Network configuration for single-host multi-node simulation
 # =============================================================================
-MASTER_ADDR=127.0.0.1  # 单机使用 localhost
+MASTER_ADDR=127.0.0.1  # Use localhost on a single host
 MASTER_PORT=6000
 RDZV_PORT=29500
 
 # =============================================================================
-# 关于端口绑定警告的说明
+# Explanation of port-binding warnings
 # =============================================================================
-# 在 c10d rendezvous 机制中，节点协调采用客户端-服务器模式：
+# The c10d rendezvous mechanism coordinates nodes using a client-server model:
 #
-# 1. 服务器模式（节点0）：
-#    - 第一个到达的节点（节点0）会绑定到 rdzv_endpoint 端口（29500）
-#    - 充当 rendezvous 服务器，等待其他节点连接
-#    - 负责协调所有节点的 rendezvous 过程
+# 1. Server mode (node 0):
+#    - The first node to arrive (node 0) binds to the rdzv_endpoint port (29500)
+#    - It acts as the rendezvous server and waits for other nodes to connect
+#    - It coordinates the rendezvous process for all nodes
 #
-# 2. 客户端模式（节点1, 2, ...）：
-#    - 后续节点在启动时会先尝试绑定端口（检查是否应该成为服务器）
-#    - 如果端口已被占用（说明节点0已经是服务器），绑定会失败
-#    - 然后自动切换为客户端模式，连接到节点0的服务器
-#    - 客户端模式：主动连接到服务器，而不是监听端口等待连接
+# 2. Client mode (nodes 1, 2, ...):
+#    - Subsequent nodes first try to bind the port at startup (to check whether they should become the server)
+#    - If the port is occupied (meaning node 0 is already the server), binding fails
+#    - The node then switches to client mode automatically and connects to node 0
+#    - In client mode, the node connects to the server instead of listening for connections
 #
-# 3. 为什么会出现警告？
-#    - 这是 c10d 的设计机制：每个节点都会先尝试绑定端口
-#    - 如果绑定失败（端口已被占用），说明已经有服务器了，就切换为客户端
-#    - 在单机多卡模拟多节点时，所有"节点"实际在同一台机器上
-#    - 因此节点1+ 的端口绑定尝试会失败，这是正常的
+# 3. Why does the warning appear?
+#    - This is part of the c10d design: every node first attempts to bind the port
+#    - If binding fails because the port is occupied, a server already exists, so the node becomes a client
+#    - During single-host multi-GPU simulation, all "nodes" are actually on the same host
+#    - Therefore, port-binding attempts by nodes 1 and above fail as expected
 #
-# 4. 这与单机多卡模拟有关吗？
-#    - 是的，但即使在真实多节点环境中也可能出现类似的警告
-#    - 因为 c10d 的设计就是让每个节点都尝试绑定，然后根据结果决定角色
-#    - 在真实多节点环境中，如果节点1比节点0先启动，节点1会成为服务器
-#    - 在单机模拟中，由于是同一台机器，端口冲突更明显，但机制相同
+# 4. Is this related to single-host multi-GPU simulation?
+#    - Yes, although similar warnings can also occur in a real multi-node environment
+#    - The c10d design has each node attempt to bind and choose its role based on the result
+#    - In a real multi-node environment, node 1 becomes the server if it starts before node 0
+#    - In single-host simulation, port conflicts are more visible because all nodes share one host, but the mechanism is the same
 #
-# 警告信息可以安全忽略，不会影响训练。
+# The warning can be safely ignored and does not affect training.
 
-# 网络接口 - 使用本地回环
+# Network interface - use local loopback
 export NCCL_SOCKET_IFNAME=bond0
 export GLOO_SOCKET_IFNAME=bond0
 
 WORLD_SIZE=$((TOTAL_NODES * GPUS_PER_NODE))
 
 # =============================================================================
-# GPU分配 - 关键！每个模拟节点使用不同的GPU
+# GPU assignment - each simulated node must use different GPUs
 # =============================================================================
-# 根据节点rank分配GPU
-# 节点0: GPU 0
-# 节点1: GPU 1
-# 节点2: GPU 2
-# 以此类推...
+# Assign GPUs according to node rank
+# Node 0: GPU 0
+# Node 1: GPU 1
+# Node 2: GPU 2
+# And so on...
 
 if [ $GPUS_PER_NODE -eq 1 ]; then
-    # 每个节点1个GPU - 简单映射
+    # One GPU per node - direct mapping
     GPU_ID=$NODE_RANK
     export CUDA_VISIBLE_DEVICES=$GPU_ID
-    echo "节点 $NODE_RANK 使用 GPU: $GPU_ID"
+    echo "Node $NODE_RANK uses GPU: $GPU_ID"
 else
-    # 每个节点多个GPU
+    # Multiple GPUs per node
     START_GPU=$((NODE_RANK * GPUS_PER_NODE))
     END_GPU=$((START_GPU + GPUS_PER_NODE - 1))
     GPU_LIST=$(seq -s, $START_GPU $END_GPU)
     export CUDA_VISIBLE_DEVICES=$GPU_LIST
-    echo "节点 $NODE_RANK 使用 GPU: $GPU_LIST"
+    echo "Node $NODE_RANK uses GPU: $GPU_LIST"
 fi
 
-# 验证GPU分配
+# Validate GPU assignment
 REQUIRED_GPUS=$((TOTAL_NODES * GPUS_PER_NODE))
 AVAILABLE_GPUS=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
 
 if [ $AVAILABLE_GPUS -lt $REQUIRED_GPUS ]; then
-    echo "警告: 可用GPU ($AVAILABLE_GPUS) 少于需要的GPU ($REQUIRED_GPUS)"
-    echo "当前配置: $TOTAL_NODES 个节点 × $GPUS_PER_NODE GPU/节点 = $REQUIRED_GPUS GPU"
-    echo "建议: 减少节点数或每节点GPU数"
+    echo "Warning: available GPUs ($AVAILABLE_GPUS) are fewer than required GPUs ($REQUIRED_GPUS)"
+    echo "Current configuration: $TOTAL_NODES nodes x $GPUS_PER_NODE GPUs/node = $REQUIRED_GPUS GPUs"
+    echo "Suggestion: reduce the node count or GPUs per node"
 fi
 
 # =============================================================================
-# 路径配置
+# Path configuration
 # =============================BERT-L-336M================================================
 VOCAB_FILE="/workspace/Megatron-LM/pre-tests/bert/data/vocab.txt"
 # MERGE_FILE="/workspace/Megatron-LM/pre-tests/bert2/data/bert2-merges.txt"
@@ -125,25 +125,25 @@ TENSORBOARD_LOGS_PATH="/workspace/models/bert-110M-ft-simnode/logs"
 CHECKPOINT_PATH="/dev/shm/bert-110M-ft-simnode"
 DATA_PATH="/workspace/data/text/AA/wiki_text_document"
 
-# 创建必要的目录
+# Create required directories
 mkdir -p $CHECKPOINT_PATH
 mkdir -p $TENSORBOARD_LOGS_PATH
 mkdir -p logs
 mkdir -p logs/csv
 
 # =============================================================================
-# 容错配置参数
+# Fault-tolerance configuration
 # =============================================================================
 FT_TIMEOUT_SETUP=600
 FT_TIMEOUT_STEP=300
 FT_TIMEOUT_CHECKPOINTING=420
 FT_TIMEOUT_OUT_OF_SECTION=300
 
-# 故障模拟（可选）
-# export FT_SIM_FAULT_DESC="rank_killed;1;60.0"  # 60秒后kill rank 1
+# Failure simulation (optional)
+# export FT_SIM_FAULT_DESC="rank_killed;1;60.0"  # 60 seconds before killing rank 1
 
 # =============================================================================
-# 模型和训练配置
+# Model and training configuration
 # =============================================================================
 HIDDEN_SIZE=768
 NUM_ATTENTION_HEADS=12
@@ -153,7 +153,7 @@ MICRO_BATCH_SIZE=4
 # GLOBAL_BATCH_SIZE=16
 
 # =============================================================================
-# Megatron 训练参数
+# Megatron training arguments
 # =============================================================================
 DATA_ARGS=(
     --vocab-file $VOCAB_FILE 
@@ -197,15 +197,15 @@ MODEL_ARGS=(
     --bert-no-binary-head
 )
 
-# 模型并行配置 - 根据每节点GPU数量
+# Model-parallel configuration based on GPUs per node
 if [ $GPUS_PER_NODE -gt 1 ]; then
-    # 多GPU per node: 使用张量并行
+    # Multiple GPUs per node: use tensor parallelism
     TENSOR_PARALLEL=$GPUS_PER_NODE
     PIPELINE_PARALLEL=1
 else
-    # 单GPU per node: 可以使用流水线并行
+    # One GPU per node: pipeline parallelism can be used
     TENSOR_PARALLEL=1
-    PIPELINE_PARALLEL=$TOTAL_NODES  # 或者设为1，取决于需求
+    PIPELINE_PARALLEL=$TOTAL_NODES  # or set to 1, depending on requirements
 fi
 
 MODEL_PARALLEL_ARGS=(
@@ -227,7 +227,7 @@ EVAL_AND_LOGGING_ARGS=(
 )
 
 # =============================================================================
-# 容错功能参数
+# Fault-tolerance arguments
 # =============================================================================
 FT_ARGS=(
     --enable-ft-package
@@ -235,65 +235,65 @@ FT_ARGS=(
 )
 
 # =============================================================================
-# ft_launcher 参数配置 - 模拟多节点
+# ft_launcher arguments for multi-node simulation
 # =============================================================================
 FT_LAUNCHER_ARGS=(
-    # Rendezvous 配置
+    # Rendezvous configuration
     --rdzv_backend=c10d
     --rdzv_endpoint=${MASTER_ADDR}:${RDZV_PORT}
-    --rdzv_id=megatron_bert_simulated_multinode  # 作业唯一ID
+    --rdzv_id=megatron_bert_simulated_multinode  # Unique job ID
     
-    # 多节点配置 - 关键！
-    --nnodes=${TOTAL_NODES}:${TOTAL_NODES}  # 最小:最大节点数
-    --nproc-per-node=${GPUS_PER_NODE}       # 每节点进程数
-    --node-rank=${NODE_RANK}                # 当前节点rank（重要！）
+    # Multi-node configuration
+    --nnodes=${TOTAL_NODES}:${TOTAL_NODES}  # Minimum/maximum node count
+    --nproc-per-node=${GPUS_PER_NODE}       # Processes per node
+    --node-rank=${NODE_RANK}                # Current node rank
     
-    # 容错参数
+    # Fault-tolerance arguments
     --ft-param-rank_section_timeouts=setup:${FT_TIMEOUT_SETUP},step:${FT_TIMEOUT_STEP},checkpointing:${FT_TIMEOUT_CHECKPOINTING}
     --ft-param-rank_out_of_section_timeout=${FT_TIMEOUT_OUT_OF_SECTION}
     --ft-param-rank_heartbeat_timeout=60
     
-    # 最大重启次数
+    # Maximum restart count
     --max-restarts=3
     
-    # 日志配置 - 每个节点独立的日志
+    # Logging configuration - separate logs for each node
     --log-dir=./ft_logs/node_${NODE_RANK}
 )
 
 # =============================================================================
-# 设置Python路径
+# Set the Python path
 # =============================================================================
 export PYTHONPATH=$PYTHONPATH:/workspace/Megatron-LM
 export USE_FLASH_ATTN=1
 export NVTE_SYNC_P2P=1
 
 # =============================================================================
-# 启动容错训练
+# Start fault-tolerant training
 # =============================================================================
 echo "=========================================================================="
-echo "在单机上模拟多节点容错分布式训练"
+echo "Simulating fault-tolerant multi-node distributed training on one host"
 echo "=========================================================================="
-echo "配置摘要:"
-echo "  模拟节点总数: ${TOTAL_NODES}"
-echo "  当前节点Rank: ${NODE_RANK}"
-echo "  每节点GPU数: ${GPUS_PER_NODE}"
-echo "  总进程数: ${WORLD_SIZE}"
-echo "  当前节点GPU: ${CUDA_VISIBLE_DEVICES}"
+echo "Configuration summary:"
+echo "  Total simulated nodes: ${TOTAL_NODES}"
+echo "  Current node rank: ${NODE_RANK}"
+echo "  GPUs per node: ${GPUS_PER_NODE}"
+echo "  Total processes: ${WORLD_SIZE}"
+echo "  Current node GPUs: ${CUDA_VISIBLE_DEVICES}"
 echo ""
-echo "网络配置:"
-echo "  Master地址: ${MASTER_ADDR}:${MASTER_PORT}"
+echo "Network configuration:"
+echo "  Master address: ${MASTER_ADDR}:${MASTER_PORT}"
 echo "  Rendezvous: ${MASTER_ADDR}:${RDZV_PORT}"
-echo "  网络接口: ${NCCL_SOCKET_IFNAME}"
+echo "  Network interface: ${NCCL_SOCKET_IFNAME}"
 echo ""
-echo "模型并行:"
-echo "  Tensor并行: ${TENSOR_PARALLEL}"
-echo "  Pipeline并行: ${PIPELINE_PARALLEL}"
+echo "Model parallelism:"
+echo "  Tensor parallelism: ${TENSOR_PARALLEL}"
+echo "  Pipeline parallelism: ${PIPELINE_PARALLEL}"
 echo ""
-echo "存储路径:"
+echo "Storage paths:"
 echo "  Checkpoint: ${CHECKPOINT_PATH}"
-echo "  日志目录: ./ft_logs/node_${NODE_RANK}"
+echo "  Log directory: ./ft_logs/node_${NODE_RANK}"
 echo ""
-echo "容错超时配置:"
+echo "Fault-tolerance timeout configuration:"
 echo "  Setup: ${FT_TIMEOUT_SETUP}s"
 echo "  Step: ${FT_TIMEOUT_STEP}s"
 echo "  Checkpointing: ${FT_TIMEOUT_CHECKPOINTING}s"
@@ -301,20 +301,20 @@ echo "  Out-of-section: ${FT_TIMEOUT_OUT_OF_SECTION}s"
 echo "=========================================================================="
 echo ""
 
-# 等待用户确认（可选）
+# Wait for user confirmation (optional)
 # if [ "$NODE_RANK" -eq 0 ]; then
-#     echo "提示: 请在其他终端启动其他节点"
+#     echo "Tip: start the other nodes in separate terminals"
 #     for i in $(seq 1 $((TOTAL_NODES - 1))); do
-#         echo "  终端$((i+1)): bash $0 $i $TOTAL_NODES $GPUS_PER_NODE"
+#         echo "  Terminal $((i+1)): bash $0 $i $TOTAL_NODES $GPUS_PER_NODE"
 #     done
 #     echo ""
-#     read -p "按回车键开始启动节点 $NODE_RANK..." -r
+#     read -p "Press Enter to start node $NODE_RANK..." -r
 # fi
 
-echo "启动节点 $NODE_RANK ..."
+echo "Starting node $NODE_RANK ..."
 echo ""
 
-# 执行 ft_launcher
+# Run ft_launcher
 ft_launcher \
     ${FT_LAUNCHER_ARGS[@]} \
     pretrain_bert.py \
@@ -326,9 +326,9 @@ ft_launcher \
     --distributed-backend nccl
 
 # =============================================================================
-# 训练结束
+# Training complete
 # =============================================================================
 echo "=========================================================================="
-echo "节点 ${NODE_RANK} 训练任务结束"
+echo "Training task for node ${NODE_RANK} has finished"
 echo "=========================================================================="
 

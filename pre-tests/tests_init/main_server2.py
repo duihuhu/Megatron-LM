@@ -5,24 +5,24 @@ from torch.utils.data import DataLoader, TensorDataset
 import torch.optim as optim
 import os
 
-# 初始化分布式进程组
+# Initialize the distributed process group
 def setup(rank, world_size):
     print(f"before Process {rank} initialized, {world_size} world_size")
 
     dist.init_process_group(
-        backend='nccl',               # 使用 NCCL 后端（适用于多GPU）
-        init_method='env://',          # 使用环境变量初始化
-        world_size=world_size,        # 总进程数
-        rank=rank                      # 当前进程的 rank
+        backend='nccl',               # Use the NCCL backend (for multiple GPUs)
+        init_method='env://',          # Initialize using environment variables
+        world_size=world_size,        # Total number of processes
+        rank=rank                      # Rank of the current process
     )
-    torch.cuda.set_device(rank)  # 设置每个进程使用的 GPU
+    torch.cuda.set_device(rank)  # Set the GPU used by each process
     print(f"Process {rank} initialized.")
 
-# 清理分布式环境
+# Clean up the distributed environment
 def cleanup():
     dist.destroy_process_group()
 
-# 创建模型
+# Create the model
 class SimpleModel(nn.Module):
     def __init__(self):
         super(SimpleModel, self).__init__()
@@ -31,7 +31,7 @@ class SimpleModel(nn.Module):
     def forward(self, x):
         return self.fc(x)
 
-# 分布式训练函数
+# Distributed training function
 def train(rank, world_size):
     setup(rank, world_size)
 
@@ -57,16 +57,16 @@ def train(rank, world_size):
 
     cleanup()
 
-# 启动分布式训练
+# Start distributed training
 def main():
-    world_size = 4  # 总进程数为 4，因为每台机器有 2 个进程，每个进程使用一个 GPU
-    rank = 0  # 主节点的 rank（Server 1）
+    world_size = 4  # Four total processes: two per machine, with one GPU per process
+    rank = 0  # Primary node rank (Server 1)
 
-    # 设置主节点的地址和端口
-    os.environ['MASTER_ADDR'] = '10.156.154.36'  # 主节点的 IP 地址
-    os.environ['MASTER_PORT'] = '6000'       # 端口号
+    # Set the primary node address and port
+    os.environ['MASTER_ADDR'] = '10.156.154.36'  # Primary node IP address
+    os.environ['MASTER_PORT'] = '6000'       # Port number
 
-    # 使用 spawn 启动每个进程，这里每个机器启动 2 个进程
+    # Use spawn to launch two processes on each machine
     torch.multiprocessing.spawn(train, args=(world_size,), nprocs=2, join=True)
 
 if __name__ == '__main__':

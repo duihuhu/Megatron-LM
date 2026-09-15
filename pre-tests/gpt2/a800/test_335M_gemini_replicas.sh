@@ -1,25 +1,25 @@
 #!/bin/bash
 
 # =============================================================================
-# Gemini Replicas Torch Legacy Checkpoint 测试脚本
+# Gemini Replicas Torch Legacy Checkpoint test script
 #
-# 使用 torch legacy 路径（torch.save → .pt 文件）进行多副本 checkpoint，
-# 替代原有的 distributed checkpoint（FileSystemWriterAsync + torch_dist）路径。
+# Use the torch legacy path (torch.save to .pt files) for replicated checkpoints,
+# instead of the original distributed checkpoint (FileSystemWriterAsync + torch_dist) path.
 #
-# 与 basic_ec_legacy.py / concord_legacy.py 遵循相同模式。
+# This follows the same pattern as basic_ec_legacy.py and concord_legacy.py.
 # =============================================================================
 #
-# 用法:
+# Usage:
 #   ./test_eccheck_4nodes_node_335M_gemini_replicas_legacy.sh <node_rank> <gpu_id_0> [gpu_id_1 ...] [additional_args...]
 #
-# 示例:
-#   # 4 节点各 1 GPU (id 0)
+# Examples:
+#   # 4 nodes with 1 GPU (ID 0)
 #   ./test_eccheck_4nodes_node_335M_gemini_replicas_legacy.sh 0 0
 #
-#   # 4 节点各 8 GPU (id 0-7)
+#   # 4 nodes with 8 GPUs (IDs 0-7)
 #   ./test_eccheck_4nodes_node_335M_gemini_replicas_legacy.sh 0 0 1 2 3 4 5 6 7
 #
-#   # 4 节点各 2 GPU (id 2,3)，额外传入训练参数
+#   # 4 nodes with 2 GPUs (IDs 2, 3), and pass additional training arguments
 #   ./test_eccheck_4nodes_node_335M_gemini_replicas_legacy.sh 0 2 3 --train-iters 50
 # =============================================================================
 
@@ -37,13 +37,13 @@ export NCCL_SOCKET_IFNAME=$NETIFACES_INTERFACE
 export GLOO_SOCKET_IFNAME=$NETIFACES_INTERFACE
 
 # ---------------------------------------------------------------------------
-# Gemini Replicas 网络环境变量
+# Gemini Replicas network environment variables
 # ---------------------------------------------------------------------------
-# 数据传输走的高速网络接口名
+# High-speed network interface used for data transfer
 export GEMINI_REPLICAS_INTERFACE=$NETIFACES_INTERFACE
-# 各 rank 监听的基础 IP（通常设为 MASTER_ADDR，各 rank 用 GEMINI_REPLICAS_BASE_PORT + rank*100 派生端口）
+# Base IP on which ranks listen (usually MASTER_ADDR; each rank derives its port as GEMINI_REPLICAS_BASE_PORT + rank*100)
 # export GEMINI_REPLICAS_BASE_IP=$MASTER_ADDR
-# 基础端口号，每个 rank 占用 100 个端口范围以避免冲突
+# Base port; each rank reserves a range of 100 ports to avoid conflicts
 # export GEMINI_REPLICAS_BASE_PORT=12345
 
 MASTER_PORT=${MASTER_PORT:-6000}
@@ -55,7 +55,7 @@ NNODES=${NNODES:-8}
 export GEMINI_REPLICAS_BASE_PORT=${GEMINI_REPLICAS_BASE_PORT:-$((MASTER_PORT + 30000))}
 export GEMINI_REPLICAS_RECOVERY_BASE_PORT=${GEMINI_REPLICAS_RECOVERY_BASE_PORT:-$((MASTER_PORT + 40000))}
 
-# ---- 节点 rank 解析（第一个参数） ----
+# ---- Parse the node rank (first argument) ----
 NODE_RANK=0
 if [ -n "$1" ]; then
     if [[ "$1" =~ ^[0-9]+$ ]]; then
@@ -64,9 +64,9 @@ if [ -n "$1" ]; then
     fi
 fi
 
-# ---- GPU ID 解析（后续连续数字参数） ----
-# 与 Concord 脚本相同：收集所有连续数字参数作为 GPU ID，
-# 遇到第一个非数字参数停止收集，之后的参数透传给训练脚本。
+# ---- Parse GPU IDs (subsequent consecutive numeric arguments) ----
+# As in the Concord script, collect all consecutive numeric arguments as GPU IDs,
+# stop at the first non-numeric argument, and pass the remaining arguments through to the training script.
 GPU_IDS=()
 while [ -n "$1" ] && [[ "$1" =~ ^[0-9]+$ ]]; do
     GPU_IDS+=("$1")
@@ -163,7 +163,7 @@ esac
 
 ARGS_TO_PASS=("$@")
 
-# 模型固定参数
+# Fixed model parameters
 HIDDEN_SIZE=1024
 NUM_ATTENTION_HEADS=16
 SEQ_LENGTH=1024
@@ -217,7 +217,7 @@ MODEL_PARALLEL_ARGS=(
 )
 
 # =============================================================================
-# Gemini Replicas Torch Legacy 核心参数说明
+# Gemini Replicas Torch Legacy core parameter notes
 # =============================================================================
 
 EVAL_AND_LOGGING_ARGS=(
@@ -225,97 +225,97 @@ EVAL_AND_LOGGING_ARGS=(
     --save-interval 1
     --eval-interval 100
     #--save $CHECKPOINT_PATH
-    #--load $CHECKPOINT_PATH          # 取消注释以测试 load
+    #--load $CHECKPOINT_PATH          # Uncomment to test load
     --eval-iters 1
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 
     # ---------------------------------------------------------------------------
-    # 必选：启用 Gemini Replicas torch legacy checkpoint
+    # Required: enable Gemini Replicas torch legacy checkpoints
     # ---------------------------------------------------------------------------
-    # 启用 Gemini Replicas（替代原有的 --use-gemini，后者是两副本 EC 风格配对）
+    # Enable Gemini Replicas (replaces --use-gemini, which uses two-replica EC-style pairing)
     --use-gemini-replicas
-    # 启用优化路径：使用连续 CPU buffer + C++ ASIO/RDMA 网络传输，跳过 torch.save 序列化开销
+    # Enable the optimized path: use contiguous CPU buffers and C++ ASIO/RDMA transfer, bypassing torch.save serialization overhead
     --use-gemini-replicas-optimized
     #--gemini-replicas-debug
 
     # ---------------------------------------------------------------------------
-    # 副本数：每个 rank 的数据在组内存放 N 份（含本地）
+    # Replica count: store N copies of each rank's data within the group (including the local copy)
     # ---------------------------------------------------------------------------
-    --gemini-replicas-num 2        # 默认 3。设为 2 即两副本，设为 N 即 N 副本
-                                        # 在组内 round-robin 轮询放置副本
-                                        # 容错能力 = num_replicas - 1 个 rank 同时故障
+    --gemini-replicas-num 2        # Default: 3. Set to 2 for two replicas or N for N replicas
+                                        # Place replicas round-robin within the group
+                                        # Fault tolerance = num_replicas - 1 simultaneous rank failures
 
     # ---------------------------------------------------------------------------
-    # 分组大小：将 world 划分为独立组，副本仅在组内轮询
+    # Group size: divide the world into independent groups and rotate replicas only within each group
     # ---------------------------------------------------------------------------
-    --gemini-replicas-group-size 2   # 默认 None（全局轮询，不做分组）
-                                        # 设 8 则每 8 个 rank 一组，每组独立
-                                        # 必须能被 world_size 整除
-                                        # 独立于节点数和每节点 rank 数，但数学上要求
-                                        #   num_nodes % group_size == 0 才能启用
-                                        #   跨节点交错排列（Concord 同款布局）
-                                        # 每组内每个 rank 来自不同物理节点
+    --gemini-replicas-group-size 2   # Default: None (global rotation without grouping)
+                                        # Set to 8 for independent groups of eight ranks
+                                        # Must divide world_size evenly
+                                        # Independent of node count and ranks per node, but mathematically requires
+                                        #   num_nodes % group_size == 0 must hold to enable this mode
+                                        #   Interleave ranks across nodes (the same layout as Concord)
+                                        # Each rank in a group comes from a different physical node
 
     # ---------------------------------------------------------------------------
-    # 传输方式：RDMA（InfiniBand）或 TCP（ASIO）
+    # Transport: RDMA (InfiniBand) or TCP (ASIO)
     # ---------------------------------------------------------------------------
-    --use-rdma                       # 启用 RDMA（默认走 TCP/ASIO）
-                                        # 开启后 send/recv 双向走 InfiniBand verbs
-                                        # 需要硬件支持 + 提前注册内存
+    --use-rdma                       # Enable RDMA (TCP/ASIO is used by default).
+                                        # When enabled, both send and receive use InfiniBand verbs
+                                        # Requires hardware support and preregistered memory
 
     # ---------------------------------------------------------------------------
-    # 恢复模式（load 时使用，save 不需要）
+    # Recovery mode (used for load; not needed for save)
     # ---------------------------------------------------------------------------
-    # 方式 1 — 自动检测（文件缺失 = 故障）:
-    #   删掉要模拟故障的 rank 的 main 文件，然后 load。
-    #   系统自动检测缺失 → 组内选 sender 通过 torch.distributed 发送副本数据。
-    #   恢复完成后自动重新生成 main 文件。
-    #   测试方法：save 完成后删故障 rank 的 gemini_replicas_main_rank*.pt，
-    #            然后带相同参数 load。
+    # Method 1 — automatic detection (missing file = failure):
+    #   Delete the main file of the rank whose failure is being simulated, then load.
+    #   The system detects the missing file and selects a sender in the group to transfer replica data through torch.distributed.
+    #   The main file is regenerated automatically after recovery.
+    #   Test procedure: after save completes, delete the failed rank's gemini_replicas_main_rank*.pt,
+    #            then load with the same arguments.
     #
     #   --use-gemini-replicas-hardware-failure
 
-    # 方式 2 — 指定故障 rank（不删文件，精确控制）:
-    #   指定哪些 rank 模拟故障。这些 rank 即使 main 文件存在也会走恢复路径。
-    #   测试方法：save 完成后直接 load，加下面参数。
-    #   示例："2,3" 表示 rank2 和 rank3 当作故障处理。
+    # Method 2 — specified failed ranks (without deleting files for precise control):
+    #   Specify which ranks simulate failures. These ranks use the recovery path even if their main files exist.
+    #   Test procedure: load directly after save completes and add the argument below.
+    # Example: "2,3" treats rank 2 and rank 3 as failed.
     #
     #--use-gemini-replicas-software-failure
     #--gemini-replicas-recovery-rank "0"
 
     # ---------------------------------------------------------------------------
-    # ckpt 格式：必须用 torch（legacy 路径）
+    # Checkpoint format: torch is required (legacy path)
     # ---------------------------------------------------------------------------
-    --ckpt-format torch               # 必须！legacy 路径要求 torch 格式
-                                        # 不能用 torch_dist（那是分布式 checkpoint 路径）
-    # 注意：不能设置 --use-dist-ckpt，否则会走 GLOBAL 类型而非 LEGACY
-    # 程序内部检测：ckpt_type=LEGACY + ckpt_format=torch 才允许 gemini_replicas
+    --ckpt-format torch               # Required! Legacy path requires torch format
+                                        # Do not use torch_dist (that is the distributed checkpoint path)
+    # Note: do not set --use-dist-ckpt; otherwise it uses GLOBAL type instead of LEGACY
+    # Internal validation: ckpt_type=LEGACY + ckpt_format=torch is required to allow gemini_replicas
 
     --save-embeddings-separately
-    # --no-save-optim                 # 取消注释以跳过 optimizer 保存
-    # --no-load-optim                 # 取消注释以跳过 optimizer 加载
+    # --no-save-optim                 # Uncomment to skip saving the optimizer.
+    # --no-load-optim                 # Uncomment to skip loading the optimizer.
 )
 
 # =============================================================================
-# 参数组合速查
+# Argument combination quick reference
 # =============================================================================
 #
-# 场景 1 — 全局 3 副本（默认，小规模测试）:
+# Scenario 1 — three global replicas (default, small-scale test):
 #   --use-gemini-replicas --use-gemini-replicas-optimized --ckpt-format torch
 #
-# 场景 2 — 全局 2 副本（等同于原 Gemini 两副本，round-robin 配对）:
+# Scenario 2 — two global replicas (equivalent to the original two-replica Gemini with round-robin pairing):
 #   --use-gemini-replicas --use-gemini-replicas-optimized
 #   --gemini-replicas-num 2 --ckpt-format torch
 #
-# 场景 3 — 8 节点各 8 GPU，组大小 8，组内 4 副本:
+# Scenario 3 — eight nodes with eight GPUs each, group size 8, four replicas per group:
 #   --use-gemini-replicas --use-gemini-replicas-optimized
 #   --gemini-replicas-num 4 --gemini-replicas-group-size 8 --ckpt-format torch
 #
-# 场景 4 — 硬件故障恢复（删文件后自动检测）:
+# Scenario 4 — hardware failure recovery (automatic detection after deleting files):
 #   --use-gemini-replicas --use-gemini-replicas-optimized
 #   --use-gemini-replicas-hardware-failure --use-rdma --ckpt-format torch
 #
-# 场景 5 — 指定 rank2,3 故障（不删文件，精确控制）:
+# Scenario 5 — treat rank 2 and rank 3 as failed without deleting files:
 #   --use-gemini-replicas --use-gemini-replicas-optimized
 #   --gemini-replicas-recovery-rank 2,3 --ckpt-format torch
 #

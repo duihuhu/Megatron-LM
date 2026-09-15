@@ -2,10 +2,10 @@ import torch
 from torch.utils.checkpoint import checkpoint
 
 print("=" * 60)
-print("测试 Checkpoint 机制")
+print("Test the Checkpoint Mechanism")
 print("=" * 60)
 
-# 测试 1: 标准模式
+# Test 1: Standard Mode
 x = torch.randn(10, 20, requires_grad=True)
 w = torch.randn(20, 30, requires_grad=True)
 
@@ -14,13 +14,13 @@ def my_func(x):
     z = torch.relu(y)
     return z
 
-# 不使用 checkpoint
+# Do not use checkpoint
 output1 = my_func(x)
-print("\n【标准模式】")
+print("\n[Standard Mode]")
 print(f"grad_fn: {output1.grad_fn}")
 print(f"grad_fn type: {type(output1.grad_fn).__name__}")
 
-# 查看计算图
+# Inspect the computation graph
 node = output1.grad_fn
 depth = 0
 while node is not None:
@@ -31,15 +31,15 @@ while node is not None:
     else:
         break
 
-# 测试 2: Checkpoint 模式
+# Test 2: Checkpoint Mode
 x2 = torch.randn(10, 20, requires_grad=True)
 
 output2 = checkpoint(my_func, x2, use_reentrant=True)
-print("\n【Checkpoint 模式】")
+print("\n[Checkpoint Mode]")
 print(f"grad_fn: {output2.grad_fn}")
 print(f"grad_fn type: {type(output2.grad_fn).__name__}")
 
-# 查看计算图
+# Inspect the computation graph
 node = output2.grad_fn
 depth = 0
 while node is not None:
@@ -50,9 +50,9 @@ while node is not None:
     else:
         break
 
-# 测试 3: 更复杂的例子，查看保存的张量
+# Test 3: A more complex example that inspects saved tensors
 print("\n" + "=" * 60)
-print("测试保存的张量数量")
+print("Test the Number of Saved Tensors")
 print("=" * 60)
 
 class MyModule(torch.nn.Module):
@@ -60,7 +60,7 @@ class MyModule(torch.nn.Module):
         super().__init__()
         self.fc1 = torch.nn.Linear(20, 50)
         self.fc2 = torch.nn.Linear(50, 30)
-    
+
     def forward(self, x):
         h = self.fc1(x)
         h = torch.relu(h)
@@ -70,12 +70,12 @@ class MyModule(torch.nn.Module):
 model = MyModule()
 x3 = torch.randn(10, 20, requires_grad=True)
 
-# 标准模式
+# Standard Mode
 output3 = model(x3)
-print(f"\n【标准模式 - 复杂网络】")
-print(f"输出 grad_fn: {type(output3.grad_fn).__name__}")
+print(f"\n[Standard Mode - Complex Network]")
+print(f"Output grad_fn: {type(output3.grad_fn).__name__}")
 
-# 统计计算图深度
+# Calculate computation graph depth
 def count_graph_depth(grad_fn):
     if grad_fn is None:
         return 0
@@ -87,21 +87,21 @@ def count_graph_depth(grad_fn):
     return max_depth + 1
 
 depth = count_graph_depth(output3.grad_fn)
-print(f"计算图深度: {depth}")
+print(f"Computation graph depth: {depth}")
 
-# Checkpoint 模式
+# Checkpoint Mode
 x4 = torch.randn(10, 20, requires_grad=True)
 output4 = checkpoint(model, x4, use_reentrant=True)
-print(f"\n【Checkpoint 模式 - 复杂网络】")
-print(f"输出 grad_fn: {type(output4.grad_fn).__name__}")
+print(f"\n[Checkpoint Mode - Complex Network]")
+print(f"Output grad_fn: {type(output4.grad_fn).__name__}")
 
 depth = count_graph_depth(output4.grad_fn)
-print(f"计算图深度: {depth}")
+print(f"Computation graph depth: {depth}")
 
 print("\n" + "=" * 60)
-print("结论:")
+print("Conclusion:")
 print("=" * 60)
-print("1. 标准模式: 完整的计算图，包含所有中间操作")
-print("2. Checkpoint 模式: 计算图被 CheckpointFunction 截断")
-print("3. Checkpoint 只保存输入，中间激活在 backward 时重新计算")
+print("1. Standard Mode: Complete computation graph containing all intermediate operations")
+print("2. Checkpoint Mode: The computation graph is truncated by CheckpointFunction")
+print("3. Checkpoint Only inputs are saved; intermediate activations are recomputed during backward")
 
